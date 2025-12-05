@@ -1,46 +1,52 @@
-import { API_BASE_URL } from "./config";
+const API_BASE = "http://52.69.165.88:3000";
 
-export interface DashboardRow {
-  symbol: string;
-  price: number | null;
-  cvd15m: number | null;
-  oiChangePct: number | null;
-  rvol15m: number | null;
-  fundingRate: number | null;
-  imbalanceScore: number | null;
-  zone: string | null;
-  sweep: string | null;
-  divergence: boolean | null;
-  status: string;
-}
-
-export interface DashboardResponse {
+export async function fetchDashboard(): Promise<{
   lastUpdate: string;
-  data: DashboardRow[];
+  data: any[];
+}> {
+  const res = await fetch(`${API_BASE}/api/dashboard`);
+  if (!res.ok) {
+    throw new Error(`/api/dashboard HTTP ${res.status}`);
+  }
+  return res.json();
 }
 
-export interface WalletResponse {
+export async function fetchWallet(): Promise<{
   availableUSDT: number;
+}> {
+  const res = await fetch(`${API_BASE}/api/wallet`);
+  if (!res.ok) {
+    throw new Error(`/api/wallet HTTP ${res.status}`);
+  }
+  return res.json();
 }
 
-export interface LogsResponse {
+export async function fetchLogs(
+  limit = 30
+): Promise<{
   logs: any[];
-}
-
-export async function fetchDashboard(): Promise<DashboardResponse> {
-  const res = await fetch(`${API_BASE_URL}/api/dashboard`);
-  if (!res.ok) throw new Error("Failed to fetch dashboard");
+}> {
+  const res = await fetch(`${API_BASE}/api/logs?limit=${limit}`);
+  if (!res.ok) {
+    throw new Error(`/api/logs HTTP ${res.status}`);
+  }
   return res.json();
 }
 
-export async function fetchWallet(): Promise<WalletResponse> {
-  const res = await fetch(`${API_BASE_URL}/api/wallet`);
-  if (!res.ok) throw new Error("Failed to fetch wallet");
-  return res.json();
-}
-
-export async function fetchLogs(limit = 50): Promise<LogsResponse> {
-  const res = await fetch(`${API_BASE_URL}/api/logs?limit=${limit}`);
-  if (!res.ok) throw new Error("Failed to fetch logs");
+// Funding + Open Interest (market-funding endpoint)
+export async function fetchMarketFunding(): Promise<{
+  ok: boolean;
+  data: {
+    symbol: string;
+    fundingRate: number | null;
+    fundingTime: number | null;
+    openInterest: number | null;
+    oiTime: number | null;
+  }[];
+}> {
+  const res = await fetch(`${API_BASE}/api/market-funding`);
+  if (!res.ok) {
+    throw new Error(`/api/market-funding HTTP ${res.status}`);
+  }
   return res.json();
 }

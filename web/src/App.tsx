@@ -1,5 +1,10 @@
 import { useEffect, useState } from "react";
-import { fetchDashboard, fetchWallet, fetchLogs } from "./api";
+import {
+  fetchDashboard,
+  fetchWallet,
+  fetchLogs,
+  fetchMarketFunding
+} from "./api";
 import "./App.css";
 
 interface DashboardRow {
@@ -16,6 +21,14 @@ interface DashboardRow {
   status: string;
 }
 
+interface MarketFundingRow {
+  symbol: string;
+  fundingRate: number | null;
+  fundingTime: number | null;
+  openInterest: number | null;
+  oiTime: number | null;
+}
+
 interface SystemLog {
   time: string;
   level: "INFO" | "WARN" | "ERROR";
@@ -29,13 +42,9 @@ function formatNumber(value: number | null | undefined, decimals = 2): string {
   return value.toFixed(decimals);
 }
 
-function formatPct(value: number | null | undefined, decimals = 2): string {
-  if (value === null || value === undefined || isNaN(value)) return "-";
-  return `${value.toFixed(decimals)}%`;
-}
-
 function App() {
   const [dashboard, setDashboard] = useState<DashboardRow[]>([]);
+  const [marketFunding, setMarketFunding] = useState<MarketFundingRow[]>([]);
   const [lastUpdate, setLastUpdate] = useState<string>("");
   const [wallet, setWallet] = useState<number | null>(null);
   const [logs, setLogs] = useState<SystemLog[]>([]);
@@ -44,15 +53,18 @@ function App() {
   async function loadAll() {
     try {
       setLoading(true);
-      const [d, w, l] = await Promise.all([
+      const [d, w, l, mf] = await Promise.all([
         fetchDashboard(),
         fetchWallet(),
-        fetchLogs(30)
+        fetchLogs(30),
+        fetchMarketFunding()
       ]);
+
       setDashboard(d.data);
       setLastUpdate(d.lastUpdate);
       setWallet(w.availableUSDT);
       setLogs(l.logs.slice().reverse());
+      setMarketFunding(mf.data);
     } catch (err) {
       console.error("Load error:", err);
     } finally {
@@ -65,6 +77,18 @@ function App() {
     const id = setInterval(loadAll, 5000);
     return () => clearInterval(id);
   }, []);
+
+  // Dashboard + Funding verisini birleştir
+  const mergedDashboard: DashboardRow[] = dashboard.map((row) => {
+    const mf = marketFunding.find((m) => m.symbol === row.symbol);
+    return {
+      ...row,
+      fundingRate:
+        mf && mf.fundingRate !== null && mf.fundingRate !== undefined
+          ? mf.fundingRate
+          : row.fundingRate
+    };
+  });
 
   return (
     <div className="app-root">
@@ -83,7 +107,7 @@ function App() {
         <section className="panel panel-large">
           <div className="panel-header">Canlı Piyasa Tarayıcısı</div>
           <div className="table-wrapper">
-            {loading && dashboard.length === 0 ? (
+            {loading && mergedDashboard.length === 0 ? (
               <div className="loading">Yükleniyor...</div>
             ) : (
               <table className="market-table">
@@ -92,7 +116,7 @@ function App() {
                     <th>COIN</th>
                     <th>FİYAT</th>
                     <th>CVD (15M)</th>
-                    <th>OI %</th>
+                    <th>OI</th>
                     <th>RVOL</th>
                     <th>FUNDING</th>
                     <th>IMB</th>
@@ -103,72 +127,87 @@ function App() {
                   </tr>
                 </thead>
                 <tbody>
-                  {dashboard.map((row) => (
-                    <tr key={row.symbol}>
-                      <td className="cell-symbol">{row.symbol}</td>
-                      <td>{formatNumber(row.price, 6)}</td>
-                      <td className={row.cvd15m && row.cvd15m > 0 ? "pos" : "neg"}>
-                        {formatNumber(row.cvd15m, 2)}
-                      </td>
-                      <td
-                        className={
-                          row.oiChangePct && row.oiChangePct < 0 ? "neg" : "pos"
-                        }
-                      >
-                        {formatPct(row.oiChangePct ?? null, 2)}
-                      </td>
-                      <td>{formatNumber(row.rvol15m, 2)}</td>
-                      <td
-                        className={
-                          row.fundingRate && row.fundingRate < 0 ? "neg" : "pos"
-                        }
-                      >
-                        {row.fundingRate !== null &&
-                        row.fundingRate !== undefined
-                          ? `${(row.fundingRate * 100).toFixed(4)}%`
-                          : "-"}
-                      </td>
-                      <td>{formatNumber(row.imbalanceScore, 2)}</td>
-                      <td>
-                        {row.zone ? (
+                  {mergedDashboard.map((row) => {
+                    const mf = marketFunding.find(
+                      (m) => m.symbol === row.symbol
+                    );
+                    const oiValue = mf?.openInterest ?? null;
+
+                    return (
+                      <tr key={row.symbol}>
+                        <td className="cell-symbol">{row.symbol}</td>
+                        <td>{formatNumber(row.price, 6)}</td>
+                        <td
+                          className={
+                            row.cvd15m && row.cvd15m > 0 ? "pos" : "neg"
+                          }
+                        >
+                          {formatNumber(row.cvd15m, 2)}
+                        </td>
+                        <td className="oi-cell">
+                          {oiValue !== null && oiValue !== undefined
+                            ? oiValue.toLocaleString("en-US", {
+                                maximumFractionDigits: 2
+                              })
+                            : "-"}
+                        </td>
+                        <td>{formatNumber(row.rvol15m, 2)}</td>
+                        <td
+                          className={
+                            row.fundingRate && row.fundingRate < 0
+                              ? "neg"
+                              : "pos"
+                          }
+                        >
+                          {row.fundingRate !== null &&
+                          row.fundingRate !== undefined
+                            ? `${(row.fundingRate * 100).toFixed(4)}%`
+                            : "-"}
+                        </td>
+                        <td>{formatNumber(row.imbalanceScore, 2)}</td>
+                        <td>
+                          {row.zone ? (
+                            <span
+                              className={
+                                row.zone === "DEMAND"
+                                  ? "badge badge-green"
+                                  : row.zone === "SUPPLY"
+                                  ? "badge badge-red"
+                                  : "badge badge-gray"
+                              }
+                            >
+                              {row.zone}
+                            </span>
+                          ) : (
+                            "-"
+                          )}
+                        </td>
+                        <td>
+                          {row.sweep ? (
+                            <span className="badge badge-yellow">
+                              {row.sweep}
+                            </span>
+                          ) : (
+                            "-"
+                          )}
+                        </td>
+                        <td>{row.divergence ? "YES" : "-"}</td>
+                        <td>
                           <span
                             className={
-                              row.zone === "DEMAND"
+                              row.status === "PUSU"
+                                ? "badge badge-yellow"
+                                : row.status === "IN_TRADE"
                                 ? "badge badge-green"
-                                : row.zone === "SUPPLY"
-                                ? "badge badge-red"
                                 : "badge badge-gray"
                             }
                           >
-                            {row.zone}
+                            {row.status}
                           </span>
-                        ) : (
-                          "-"
-                        )}
-                      </td>
-                      <td>
-                        {row.sweep ? (
-                          <span className="badge badge-yellow">{row.sweep}</span>
-                        ) : (
-                          "-"
-                        )}
-                      </td>
-                      <td>{row.divergence ? "YES" : "-"}</td>
-                      <td>
-                        <span
-                          className={
-                            row.status === "PUSU"
-                              ? "badge badge-yellow"
-                              : row.status === "IN_TRADE"
-                              ? "badge badge-green"
-                              : "badge badge-gray"
-                          }
-                        >
-                          {row.status}
-                        </span>
-                      </td>
-                    </tr>
-                  ))}
+                        </td>
+                      </tr>
+                    );
+                  })}
                 </tbody>
               </table>
             )}

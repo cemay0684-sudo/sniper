@@ -1,7 +1,6 @@
 import { BinanceRestClient } from "../binanceRestClient";
 import { CONFIG } from "../config";
 import { FuturesSymbol } from "../types";
-import { FundingRateInfo, OpenInterestInfo } from "../types";
 
 export interface SymbolFundingState {
   symbol: FuturesSymbol;
@@ -62,7 +61,7 @@ export class FundingState {
   }
 
   /**
-   * Tüm semboller için funding ve OI güncelle
+   * Tüm semboller için funding ve OI güncelle.
    */
   public async refreshAll(): Promise<void> {
     const symbols = CONFIG.symbols as FuturesSymbol[];
@@ -106,5 +105,34 @@ export class FundingState {
     } catch (err) {
       console.error("FundingState: BTC Dominance refresh error", err);
     }
+  }
+
+  /**
+   * UI için toplu funding + OI listesi
+   */
+  public getAllForUi() {
+    const result: {
+      symbol: FuturesSymbol;
+      fundingRate: number | null;
+      fundingTime: number | null;
+      openInterest: number | null;
+      oiTime: number | null;
+    }[] = [];
+
+    const symbols = CONFIG.symbols as FuturesSymbol[];
+
+    for (const sym of symbols) {
+      const f = this.getFunding(sym);
+      const oi = this.getOpenInterest(sym);
+      result.push({
+        symbol: sym,
+        fundingRate: f.fundingRate,
+        fundingTime: f.fundingTime,
+        openInterest: oi.openInterest,
+        oiTime: oi.time
+      });
+    }
+
+    return result;
   }
 }

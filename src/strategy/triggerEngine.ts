@@ -1,44 +1,81 @@
-import { CandleState } from "../state/candleState";
+import { CandleState, Candle, Interval } from "../state/candleState";
 import { OrderflowState } from "../state/orderflowState";
 import { FundingState } from "../state/fundingState";
 import { FuturesSymbol } from "../types";
 import {
-  checkSessionFilter,
-  // checkFundingFilter,
-  // checkDominanceFilter,
+  check15mSetup,
+  SetupDirection,
+  SetupCheckResult,
+} from "./setupDetector";
+import {
+  checkSessionFilter /*, checkFundingFilter, checkDominanceFilter */,
 } from "./globalFilters";
 import { ExecutionClient, Side } from "../execution/executionClient";
-import { addSystemLog } from "../utils/systemLog";
 
 export interface TriggerSignal {
+  id: string;
   symbol: FuturesSymbol;
-  direction: Side;
-  entryCandle5m: {
-    openTime: number;
-    closeTime: number;
-    open: number;
-    high: number;
-    low: number;
-    close: number;
-    volume: number;
-  };
+  direction: SetupDirection;
+  entryCandle5m: Candle;
+  setupInfo: SetupCheckResult;
+  createdAt: string;
 }
 
+/**
+ * Setup bekleyen 15m mum bilgisi
+ */
 interface PendingSetup {
   symbol: FuturesSymbol;
-  direction: Side;
-  createdAt: number;
-  entryWindowMs: number;
+  direction: SetupDirection;
+  setupCandle15mOpenTime: number;
+  setupInfo: SetupCheckResult;
 }
 
-export class TriggerEngine {
-  private readonly candleState: CandleState;
-  private readonly orderflowState: OrderflowState;
-  private readonly fundingState: FundingState;
-  private readonly executionClient: ExecutionClient;
+/**
+ * Dashboard için sembol bazlı özet durum
+ */
+export interface SymbolDashboardState {
+  hasPendingSetup: boolean;
+  lastSetupHasSweep: boolean | null;
+  lastSetupHasDiv: boolean | null;
+}
 
-  private readonly pendingSetups: Map<string, PendingSetup> = new Map();
-  private signalCallbacks: ((signal: TriggerSignal) => void)[] = [];
+/**
+ * TriggerEngine:
+ *  - 15m mum kapanışlarında setup var mı diye bakar.
+ *  - Varsa, o setup için bir "pending setup" kaydeder.
+ *  - Sonraki 5m kapanışlarında:
+ *      - LONG: yeşil mum (close > open) -> sinyal üret
+ *      - SHORT: kırmızı mum (close < open) -> sinyal üret
+ *  - Sinyali hem console.log ile gösterir hem de ExecutionClient'e emir atması için iletir.
+ *
+ * NOT (V1 KARARI):
+ *  - Funding ve BTC Dominance filtreleri, REST tarafı stabil hale gelene kadar TRIGGER seviyesinde devre dışıdır.
+ *  - GlobalFilters içindeki fonksiyonlar duruyor; ileride tekrar açmak çok kolay olacak.
+ *
+ * SL / TP (V1 KURAL):
+ *  - LONG:
+ *      entry = 5m close
+ *      SL = entry * (1 - 0.01)  -> %1 aşağı
+ *      TP = entry * (1 + 0.02)  -> %2 yukarı
+ *  - SHORT:
+ *      entry = 5m close
+ *      SL = entry * (1 + 0.01)
+ *      TP = entry * (1 - 0.02)
+ */
+export class TriggerEngine {
+  private candleState: CandleState;
+  private orderflowState: OrderflowState;
+  private fundingState: FundingState;
+  private executionClient: ExecutionClient;
+
+  private pendingSetups: PendingSetup[] = [];
+
+  private onSignalHandlers: Array<(signal: TriggerSignal) => void> = [];
+
+  // Dashboard için sembol bazlı özet state
+  private dashboardState: Record<FuturesSymbol, SymbolDashboardState> =
+    {} as any;
 
   constructor(
     candleState: CandleState,
@@ -52,216 +89,238 @@ export class TriggerEngine {
     this.executionClient = executionClient;
   }
 
-  public onSignal(cb: (signal: TriggerSignal) => void) {
-    this.signalCallbacks.push(cb);
+  public onSignal(handler: (signal: TriggerSignal) => void) {
+    this.onSignalHandlers.push(handler);
   }
 
-  private emitSignal(signal: TriggerSignal) {
-    for (const cb of this.signalCallbacks) {
-      try {
-        cb(signal);
-      } catch (err) {
-        console.error("[TriggerEngine] onSignal callback error:", err);
+  /**
+   * Belirli bir sembol için dashboard özet state döner.
+   */
+  public getDashboardStateFor(symbol: FuturesSymbol): SymbolDashboardState {
+    if (!this.dashboardState[symbol]) {
+      this.dashboardState[symbol] = {
+        hasPendingSetup: false,
+        lastSetupHasSweep: null,
+        lastSetupHasDiv: null,
+      };
+    }
+    return this.dashboardState[symbol];
+  }
+
+  /**
+   * 15m mum kapanışında çağrılmalı.
+   * Tüm semboller için LONG ve SHORT setup'ları kontrol eder.
+   */
+  public handle15mClose(symbols: FuturesSymbol[]) {
+    for (const symbol of symbols) {
+      // LONG setup
+      const longSetup = check15mSetup(
+        "LONG",
+        symbol,
+        this.candleState,
+        this.orderflowState,
+        this.fundingState
+      );
+
+      if (longSetup && longSetup.passed) {
+        this.addPendingSetup(symbol, "LONG", longSetup);
+      }
+
+      // SHORT setup
+      const shortSetup = check15mSetup(
+        "SHORT",
+        symbol,
+        this.candleState,
+        this.orderflowState,
+        this.fundingState
+      );
+
+      if (shortSetup && shortSetup.passed) {
+        this.addPendingSetup(symbol, "SHORT", shortSetup);
       }
     }
   }
 
-  private keyFor(symbol: FuturesSymbol, direction: Side) {
-    return `${symbol}:${direction}`;
+  /**
+   * 5m mum kapanışında çağrılmalı.
+   * Pending setup'lar için tetik (trigger) şartını kontrol eder ve gerekirse emir atar.
+   */
+  public async handle5mClose(symbols: FuturesSymbol[]) {
+    // Session filtresi (global)
+    const session = checkSessionFilter(new Date());
+    if (!session.allowed) {
+      return;
+    }
+
+    for (const symbol of symbols) {
+      const candles5m = this.candleState
+        .getCandles(symbol, "5m" as Interval, 10)
+        .filter((c) => c.closed);
+      if (candles5m.length === 0) continue;
+      const last5m = candles5m[candles5m.length - 1];
+
+      const relatedSetups = this.pendingSetups.filter(
+        (ps) => ps.symbol === symbol
+      );
+      if (relatedSetups.length === 0) continue;
+
+      for (const ps of relatedSetups) {
+        const isGreen = last5m.close > last5m.open;
+        const isRed = last5m.close < last5m.open;
+
+        let triggered = false;
+        if (ps.direction === "LONG" && isGreen) {
+          triggered = true;
+        } else if (ps.direction === "SHORT" && isRed) {
+          triggered = true;
+        }
+
+        if (triggered) {
+          const signal: TriggerSignal = {
+            id: this.buildSignalId(symbol, ps.direction, last5m),
+            symbol,
+            direction: ps.direction,
+            entryCandle5m: last5m,
+            setupInfo: ps.setupInfo,
+            createdAt: new Date().toISOString(),
+          };
+
+          console.log(
+            `[TRIGGER] ${signal.direction} signal on ${signal.symbol} at 5m close=${signal.entryCandle5m.close}`,
+            {
+              setup: signal.setupInfo,
+            }
+          );
+
+          // Emir motorunu çağır
+          await this.executeSignal(signal);
+
+          this.onSignalHandlers.forEach((h) => h(signal));
+          this.removePending(ps);
+        } else {
+          // İleride: belirli sayıda 5m mum geçerse pending setup'ı iptal edebiliriz.
+        }
+      }
+    }
   }
 
-  private addPending(setup: PendingSetup) {
-    const key = this.keyFor(setup.symbol, setup.direction);
-    this.pendingSetups.set(key, setup);
+  /**
+   * V1 SL/TP (%1 / %2) hesaplama + ExecutionClient.openPosition çağrısı.
+   */
+  private async executeSignal(signal: TriggerSignal) {
+    const { symbol, direction, entryCandle5m } = signal;
+    const entry = entryCandle5m.close;
+
+    let sl: number;
+    let tp: number;
+    let side: Side;
+
+    if (direction === "LONG") {
+      side = "BUY";
+      sl = entry * (1 - 0.01); // -1%
+      tp = entry * (1 + 0.02); // +2%
+    } else {
+      side = "SELL";
+      sl = entry * (1 + 0.01); // +1%
+      tp = entry * (1 - 0.02); // -2%
+    }
+
+    console.log("[TriggerEngine] Executing signal with SL/TP:", {
+      symbol,
+      direction,
+      entry,
+      sl,
+      tp,
+    });
+
+    const result = await this.executionClient.openPosition({
+      symbol,
+      side,
+      quantity: 0, // Gerçek qty ExecutionClient içinde available balance'a göre hesaplanıyor
+      entryPrice: entry,
+      stopLossPrice: sl,
+      takeProfitPrice: tp,
+      leverage: 9,
+      isolated: true,
+    });
+
+    if (!result.success) {
+      console.error("[TriggerEngine] Order execution failed:", result.error);
+    } else {
+      console.log("[TriggerEngine] Order execution success:", result.details);
+    }
   }
 
-  private removePendingByKey(key: string) {
-    this.pendingSetups.delete(key);
+  private addPendingSetup(
+    symbol: FuturesSymbol,
+    direction: SetupDirection,
+    setupInfo: SetupCheckResult
+  ) {
+    const setupCandle15mOpenTime = this.getLast15mOpenTime(symbol);
+    if (setupCandle15mOpenTime === null) return;
+
+    const existing = this.pendingSetups.find(
+      (ps) =>
+        ps.symbol === symbol &&
+        ps.direction === direction &&
+        ps.setupCandle15mOpenTime === setupCandle15mOpenTime
+    );
+    if (existing) {
+      return;
+    }
+
+    const ps: PendingSetup = {
+      symbol,
+      direction,
+      setupCandle15mOpenTime,
+      setupInfo,
+    };
+    this.pendingSetups.push(ps);
+
+    // Dashboard state: bu sembolde artık pending setup var
+    const dash = this.getDashboardStateFor(symbol);
+    dash.hasPendingSetup = true;
+    dash.lastSetupHasSweep = setupInfo.hasSweep;
+    dash.lastSetupHasDiv = setupInfo.hasCvdDivergence;
+
+    console.log(
+      `[SETUP] ${direction} setup detected on ${symbol} (15m openTime=${setupCandle15mOpenTime})`,
+      setupInfo
+    );
   }
 
   private removePending(ps: PendingSetup) {
-    const key = this.keyFor(ps.symbol, ps.direction);
-    this.pendingSetups.delete(key);
-  }
+    this.pendingSetups = this.pendingSetups.filter(
+      (p) =>
+        !(
+          p.symbol === ps.symbol &&
+          p.direction === ps.direction &&
+          p.setupCandle15mOpenTime === ps.setupCandle15mOpenTime
+        )
+    );
 
-  private getPendingFor(symbol: FuturesSymbol, direction: Side) {
-    const key = this.keyFor(symbol, direction);
-    return this.pendingSetups.get(key);
-  }
-
-  /**
-   * 15m kapanışında setup oluşumunu takip eder.
-   * Buradaki asıl strateji kurallarını eski dosyandan tekrar taşıyabilirsin.
-   * Şimdilik sadece placeholder var ki derleme hatası olmasın.
-   */
-  public handle15mClose(symbols: FuturesSymbol[]) {
-    console.log("[TriggerEngine] handle15mClose - symbols:", symbols);
-  }
-
-  /**
-   * 5m kapanışında pending setup'ları TRIGGER eder (emir açmayı dener).
-   */
-  public async handle5mClose(symbols: FuturesSymbol[]) {
-    const now = Date.now();
-
-    for (const symbol of symbols) {
-      const pendings = [this.getPendingFor(symbol, "BUY"), this.getPendingFor(symbol, "SELL")].filter(
-        Boolean
-      ) as PendingSetup[];
-
-      if (!pendings.length) continue;
-
-      const candles5m = this.candleState.getCandles(symbol, "5m", 2).filter((c) => c.closed);
-      if (candles5m.length === 0) continue;
-
-      const last5m = candles5m[candles5m.length - 1];
-
-      for (const ps of pendings) {
-        if (now - ps.createdAt > ps.entryWindowMs) {
-          console.log("[TriggerEngine] Pending setup expired", ps);
-          this.removePending(ps);
-          continue;
-        }
-
-        // Session filtresi: fonksiyon Date bekliyorsa 5m closeTime'dan Date üretelim
-        const sessionTime = new Date(last5m.closeTime);
-        const sessionFilter = checkSessionFilter(sessionTime);
-        if (!sessionFilter.allowed) {
-          console.log("[TriggerEngine] Session filter blocked trigger", {
-            symbol,
-            direction: ps.direction,
-            reason: sessionFilter.reason,
-          });
-          this.removePending(ps);
-          continue;
-        }
-
-        // Funding ve BTC.D filtreleri şimdilik devre dışı:
-        // const fundingData = this.fundingState.getFunding(symbol);
-        // const fundingFilter = checkFundingFilter(ps.direction, fundingData.fundingRate);
-        // if (!fundingFilter.allowed) { this.removePending(ps); continue; }
-
-        // const domData = this.fundingState.getBtcDominance();
-        // const domFilter = checkDominanceFilter(domData);
-        // if (!domFilter.allowed) { this.removePending(ps); continue; }
-
-        const direction: Side = ps.direction;
-        const price = last5m.close;
-
-        const entryCandle5m = {
-          openTime: last5m.openTime,
-          closeTime: last5m.closeTime,
-          open: last5m.open,
-          high: last5m.high,
-          low: last5m.low,
-          close: last5m.close,
-          volume: last5m.volume,
-        };
-
-        // Basit SL/TP (eski strateji mantığına göre sonra güncelleyebilirsin)
-        const stopLossPrice =
-          direction === "BUY" ? last5m.low * 0.995 : last5m.high * 1.005;
-        const takeProfitPrice =
-          direction === "BUY" ? last5m.close * 1.02 : last5m.close * 0.98;
-
-        const availableUSDT = await this.executionClient.getAvailableUSDT();
-        const riskPct = 0.01; // Şimdilik sabit %1 risk
-        const riskAmount = availableUSDT * riskPct;
-        let quantity = 0;
-
-        if (direction === "BUY") {
-          const denom = price - stopLossPrice || price;
-          quantity = denom !== 0 ? riskAmount / denom : 0;
-        } else {
-          const denom = stopLossPrice - price || price;
-          quantity = denom !== 0 ? riskAmount / denom : 0;
-        }
-
-        const qtyRounded = this.executionClient.roundQuantity(symbol, quantity);
-        if (!Number.isFinite(qtyRounded) || qtyRounded <= 0) {
-          console.log("[TriggerEngine] Quantity invalid, skipping execution", {
-            symbol,
-            direction,
-            quantity,
-            qtyRounded,
-          });
-          this.removePending(ps);
-          continue;
-        }
-
-        console.log("[TRIGGER] EXECUTION START", {
-          symbol,
-          direction,
-          qtyRounded,
-          entryPrice: price,
-          stopLossPrice,
-          takeProfitPrice,
-          availableUSDT,
-        });
-
-        try {
-          const result = await this.executionClient.openPosition({
-            symbol,
-            side: direction,
-            quantity: qtyRounded,
-            entryPrice: price,
-            stopLossPrice,
-            takeProfitPrice,
-            leverage: 3, // Şimdilik sabit 3x
-            isolated: true,
-          });
-
-          console.log("[TRIGGER] EXECUTION RESULT", {
-            symbol,
-            direction,
-            success: result?.success,
-            error: result?.error,
-            hasDetails: !!result?.details,
-          });
-
-          addSystemLog({
-            time: new Date().toISOString(),
-            level: result?.success ? "INFO" : "ERROR",
-            source: "EXECUTION",
-            message: result?.success
-              ? `Position opened on ${symbol} ${direction}`
-              : `Failed to open position on ${symbol} ${direction}`,
-            context: {
-              symbol,
-              direction,
-              success: result?.success,
-              error: result?.error,
-            },
-          });
-
-          if (result?.success) {
-            const signal: TriggerSignal = {
-              symbol,
-              direction,
-              entryCandle5m,
-            };
-            this.emitSignal(signal);
-          }
-
-          this.removePending(ps);
-        } catch (err: any) {
-          console.error("[TRIGGER] EXECUTION THROWN ERROR", {
-            symbol,
-            direction,
-            error: err?.response?.data || String(err),
-          });
-
-          addSystemLog({
-            time: new Date().toISOString(),
-            level: "ERROR",
-            source: "EXECUTION",
-            message: `Execution threw error on ${symbol} ${direction}`,
-            context: err?.response?.data || String(err),
-          });
-
-          this.removePending(ps);
-        }
-      }
+    // Eğer bu sembol için hiç pending setup kalmadıysa dashboard state'i temizle
+    const stillHas = this.pendingSetups.some((p) => p.symbol === ps.symbol);
+    if (!stillHas) {
+      const dash = this.getDashboardStateFor(ps.symbol);
+      dash.hasPendingSetup = false;
+      // lastSetupHasSweep / lastSetupHasDiv son setup bilgisini taşımaya devam ediyor
     }
+  }
+
+  private getLast15mOpenTime(symbol: FuturesSymbol): number | null {
+    const candles15m = this.candleState
+      .getCandles(symbol, "15m" as Interval, 10)
+      .filter((c) => c.closed);
+    if (candles15m.length === 0) return null;
+    return candles15m[candles15m.length - 1].openTime;
+  }
+
+  private buildSignalId(
+    symbol: FuturesSymbol,
+    direction: SetupDirection,
+    candle: Candle
+  ): string {
+    return `${symbol}_${direction}_${candle.openTime}`;
   }
 }

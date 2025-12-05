@@ -286,6 +286,99 @@ app.get("/api/logs", (req, res) => {
   res.json({ logs });
 });
 
+// --- API: Funding overview (for UI) ---
+app.get("/api/funding", (req, res) => {
+  try {
+    const all = (fundingState as any).getAll?.() ?? [];
+    return res.json({ ok: true, data: all });
+  } catch (err: any) {
+    console.error("[API] /api/funding error", err);
+    return res.status(500).json({
+      ok: false,
+      error: "internal_error",
+      detail: String(err)
+    });
+  }
+});
+
+// --- API: Open Interest (instant from Binance REST) ---
+// Usage: GET /api/open-interest?symbol=ETHUSDT
+app.get("/api/open-interest", async (req, res) => {
+  try {
+    const symbol = (req.query.symbol as string) || "ETHUSDT";
+    const url = `https://fapi.binance.com/fapi/v1/openInterest?symbol=${encodeURIComponent(symbol)}`;
+
+    const axios = await import("axios");
+    const response = await axios.default.get(url, { timeout: 5000 });
+
+    const data = response.data;
+    return res.json({
+      ok: true,
+      data: {
+        symbol: data.symbol,
+        openInterest: Number(data.openInterest),
+        time: data.time
+      }
+    });
+  } catch (err: any) {
+    console.error("[API] /api/open-interest error", err?.response?.data || err);
+    return res.status(500).json({
+      ok: false,
+      error: "internal_error",
+      detail: err?.response?.data || String(err)
+    });
+  }
+});
+
+// --- API: Funding list (UI için) ---
+app.get("/api/funding", (req, res) => {
+  try {
+    const all =
+      (fundingState as any).getAllForUi?.() ??
+      (fundingState as any).getAll?.() ??
+      [];
+    return res.json({ ok: true, data: all });
+  } catch (err: any) {
+    console.error("[API] /api/funding error", err);
+    return res.status(500).json({
+      ok: false,
+      error: "internal_error",
+      detail: String(err)
+    });
+  }
+});
+
+// --- API: Open Interest (anlık, Binance USDT-M REST) ---
+// Örnek: GET /api/open-interest?symbol=ETHUSDT
+app.get("/api/open-interest", async (req, res) => {
+  try {
+    const symbol = (req.query.symbol as string) || "ETHUSDT";
+    const url = `https://fapi.binance.com/fapi/v1/openInterest?symbol=${encodeURIComponent(
+      symbol
+    )}`;
+
+    const axios = await import("axios");
+    const response = await axios.default.get(url, { timeout: 5000 });
+
+    const data = response.data;
+    return res.json({
+      ok: true,
+      data: {
+        symbol: data.symbol,
+        openInterest: Number(data.openInterest),
+        time: data.time
+      }
+    });
+  } catch (err: any) {
+    console.error("[API] /api/open-interest error", err?.response?.data || err);
+    return res.status(500).json({
+      ok: false,
+      error: "internal_error",
+      detail: err?.response?.data || String(err)
+    });
+  }
+});
+
 // ---- Global error handler ----
 app.use(
   (
@@ -339,5 +432,85 @@ app.listen(PORT, async () => {
 
   if (restPingOk) {
     await preloadHistoricalCandles();
+  }
+});
+
+// --- API: Market Funding + OI (UI için, gerçek Binance REST) ---
+// GET /api/market-funding
+app.get("/api/market-funding", async (_req, res) => {
+  try {
+    const symbols = CONFIG.symbols as FuturesSymbol[];
+    const rows: {
+      symbol: FuturesSymbol;
+      fundingRate: number | null;
+      fundingTime: number | null;
+      openInterest: number | null;
+      oiTime: number | null;
+    }[] = [];
+
+    const axios = (await import("axios")).default;
+
+    for (const sym of symbols) {
+      let fundingRate: number | null = null;
+      let fundingTime: number | null = null;
+      let openInterest: number | null = null;
+      let oiTime: number | null = null;
+
+      // Funding rate: gerçek Binance USDT-M
+      try {
+        const frRes = await axios.get(
+          "https://fapi.binance.com/fapi/v1/fundingRate",
+          {
+            params: { symbol: sym, limit: 1 },
+            timeout: 5000
+          }
+        );
+        if (Array.isArray(frRes.data) && frRes.data.length > 0) {
+          const item = frRes.data[0] as any;
+          const frNum = Number(item.fundingRate);
+          const ftNum = Number(item.fundingTime);
+          if (Number.isFinite(frNum)) fundingRate = frNum;
+          if (Number.isFinite(ftNum)) fundingTime = ftNum;
+        }
+      } catch (e) {
+        console.error("[API] /api/market-funding funding error", sym, e);
+      }
+
+      // Open interest: gerçek Binance USDT-M
+      try {
+        const oiRes = await axios.get(
+          "https://fapi.binance.com/fapi/v1/openInterest",
+          {
+            params: { symbol: sym },
+            timeout: 5000
+          }
+        );
+        if (oiRes.data && typeof oiRes.data === "object") {
+          const oiNum = Number((oiRes.data as any).openInterest);
+          const tNum = Number((oiRes.data as any).time);
+          if (Number.isFinite(oiNum)) openInterest = oiNum;
+          if (Number.isFinite(tNum)) oiTime = tNum;
+        }
+      } catch (e) {
+        console.error("[API] /api/market-funding oi error", sym, e);
+      }
+
+      rows.push({
+        symbol: sym,
+        fundingRate,
+        fundingTime,
+        openInterest,
+        oiTime
+      });
+    }
+
+    return res.json({ ok: true, data: rows });
+  } catch (err: any) {
+    console.error("[API] /api/market-funding error", err);
+    return res.status(500).json({
+      ok: false,
+      error: "internal_error",
+      detail: String(err)
+    });
   }
 });
