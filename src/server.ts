@@ -248,6 +248,27 @@ app.get("/api/dashboard", (_req, res) => {
       swing.swingLow4h
     );
 
+    // 4H bias: swing high/low ortalamasına göre
+    let bias4h: "LONG" | "SHORT" | "FLAT" | null = null;
+    if (
+      swing.swingHigh4h !== null &&
+      swing.swingLow4h !== null &&
+      price !== null
+    ) {
+      const mid4h = (swing.swingHigh4h + swing.swingLow4h) / 2;
+      if (price > mid4h) bias4h = "LONG";
+      else if (price < mid4h) bias4h = "SHORT";
+      else bias4h = "FLAT";
+    }
+
+    // 15M bias: cvd15m işaretine göre (örnek mantık)
+    let bias15m: "LONG" | "SHORT" | "FLAT" | null = null;
+    if (of.cvd !== null && of.cvd !== undefined) {
+      if (of.cvd > 0) bias15m = "LONG";
+      else if (of.cvd < 0) bias15m = "SHORT";
+      else bias15m = "FLAT";
+    }
+
     return {
       symbol: sym,
       price,
@@ -259,7 +280,9 @@ app.get("/api/dashboard", (_req, res) => {
       zone,
       sweep: null,
       divergence: null,
-      status: "IDLE" as const
+      status: "IDLE" as const,
+      bias4h,
+      bias15m
     };
   });
 
@@ -289,7 +312,10 @@ app.get("/api/logs", (req, res) => {
 // --- API: Funding overview (for UI) ---
 app.get("/api/funding", (req, res) => {
   try {
-    const all = (fundingState as any).getAll?.() ?? [];
+    const all =
+      (fundingState as any).getAllForUi?.() ??
+      (fundingState as any).getAll?.() ??
+      [];
     return res.json({ ok: true, data: all });
   } catch (err: any) {
     console.error("[API] /api/funding error", err);
@@ -307,55 +333,6 @@ app.get("/api/open-interest", async (req, res) => {
   try {
     const symbol = (req.query.symbol as string) || "ETHUSDT";
     const url = `https://fapi.binance.com/fapi/v1/openInterest?symbol=${encodeURIComponent(symbol)}`;
-
-    const axios = await import("axios");
-    const response = await axios.default.get(url, { timeout: 5000 });
-
-    const data = response.data;
-    return res.json({
-      ok: true,
-      data: {
-        symbol: data.symbol,
-        openInterest: Number(data.openInterest),
-        time: data.time
-      }
-    });
-  } catch (err: any) {
-    console.error("[API] /api/open-interest error", err?.response?.data || err);
-    return res.status(500).json({
-      ok: false,
-      error: "internal_error",
-      detail: err?.response?.data || String(err)
-    });
-  }
-});
-
-// --- API: Funding list (UI için) ---
-app.get("/api/funding", (req, res) => {
-  try {
-    const all =
-      (fundingState as any).getAllForUi?.() ??
-      (fundingState as any).getAll?.() ??
-      [];
-    return res.json({ ok: true, data: all });
-  } catch (err: any) {
-    console.error("[API] /api/funding error", err);
-    return res.status(500).json({
-      ok: false,
-      error: "internal_error",
-      detail: String(err)
-    });
-  }
-});
-
-// --- API: Open Interest (anlık, Binance USDT-M REST) ---
-// Örnek: GET /api/open-interest?symbol=ETHUSDT
-app.get("/api/open-interest", async (req, res) => {
-  try {
-    const symbol = (req.query.symbol as string) || "ETHUSDT";
-    const url = `https://fapi.binance.com/fapi/v1/openInterest?symbol=${encodeURIComponent(
-      symbol
-    )}`;
 
     const axios = await import("axios");
     const response = await axios.default.get(url, { timeout: 5000 });

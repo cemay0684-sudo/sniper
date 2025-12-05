@@ -223,3 +223,18 @@ body {
     grid-template-columns: 1fr;
   }
 }
+
+.bias-pill {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.bias-pill .badge {
+  font-size: 10px;
+  padding: 2px 4px;
+}
+.badge-orange {
+  background-color: rgba(255, 165, 0, 0.12);
+  color: #ffb347;
+  border: 1px solid rgba(255, 165, 0, 0.4);
+}

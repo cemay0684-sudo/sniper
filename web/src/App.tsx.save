@@ -229,22 +229,19 @@ function App() {
                           )}
                         </td>
                         <td>{row.divergence ? "YES" : "-"}</td>
-<td>
-  <span
-    className={
-      row.status === "PUSU"
-        ? "badge badge-yellow"
-        : row.status === "TRIGGER"
-        ? "badge badge-orange"
-        : row.status === "IN_TRADE"
-        ? "badge badge-green"
-        : "badge badge-gray"
-    }
-  >
-    {row.status}
-  </span>
-</td>
-
+                        <td>
+                          <span
+                            className={
+                              row.status === "PUSU"
+                                ? "badge badge-yellow"
+                                : row.status === "IN_TRADE"
+                                ? "badge badge-green"
+                                : "badge badge-gray"
+                            }
+                          >
+                            {row.status}
+                          </span>
+                        </td>
                       </tr>
                     );
                   })}
