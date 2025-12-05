@@ -1,0 +1,22 @@
+version: "3.9"
+
+services:
+  app:
+    build: .
+    container_name: smart-sniper-bot-app
+    env_file:
+      - .env
+    ports:
+      - "3000:3000"
+    restart: unless-stopped
+    # Gelecekte Redis veya başka servisler eklersek:
+    # depends_on:
+    #   - redis
+
+  # Redis'i ileride state için ekleyeceğiz:
+  # redis:
+  #   image: redis:7-alpine
+  #   container_name: smart-sniper-bot-redis
+  #   ports:
+  #     - "6379:6379"
+  #   restart: unless-stopped

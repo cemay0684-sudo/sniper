@@ -1,0 +1,225 @@
+:root {
+  color-scheme: dark;
+  --bg-main: #050608;
+  --bg-panel: #111319;
+  --bg-header: #0b0d12;
+  --border-color: #252838;
+  --text-main: #f5f5f5;
+  --text-muted: #8c8fa5;
+  --accent-yellow: #ffc300;
+  --accent-green: #03c988;
+  --accent-red: #ff4d4f;
+}
+
+body {
+  margin: 0;
+  font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  background-color: var(--bg-main);
+  color: var(--text-main);
+}
+
+.app-root {
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+  background: radial-gradient(circle at top left, #1a1d2b 0, #050608 50%, #050608 100%);
+}
+
+.app-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 14px 24px;
+  background: var(--bg-header);
+  border-bottom: 1px solid var(--border-color);
+}
+
+.app-header h1 {
+  font-size: 18px;
+  letter-spacing: 0.04em;
+}
+
+.header-right {
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.app-main {
+  display: grid;
+  grid-template-columns: minmax(0, 3fr) minmax(280px, 1.1fr);
+  gap: 16px;
+  padding: 16px 24px 24px;
+}
+
+.panel {
+  background: var(--bg-panel);
+  border-radius: 8px;
+  border: 1px solid var(--border-color);
+  display: flex;
+  flex-direction: column;
+}
+
+.panel-large {
+  background: var(--bg-panel);
+  border-radius: 8px;
+  border: 1px solid var(--border-color);
+  grid-column: 1 / 2;
+}
+
+.panel-header {
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--border-color);
+  font-size: 13px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--text-muted);
+}
+
+.table-wrapper {
+  padding: 10px 12px;
+  overflow: auto;
+}
+
+.market-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12px;
+}
+
+.market-table thead {
+  background: #151824;
+}
+
+.market-table th,
+.market-table td {
+  padding: 8px 10px;
+  border-bottom: 1px solid #1e2130;
+  white-space: nowrap;
+}
+
+.market-table th {
+  font-weight: 500;
+  color: var(--text-muted);
+  text-align: left;
+  font-size: 11px;
+}
+
+.market-table tbody tr:hover {
+  background: #181b28;
+}
+
+.cell-symbol {
+  color: #58a6ff;
+  font-weight: 600;
+}
+
+.pos {
+  color: var(--accent-green);
+}
+
+.neg {
+  color: var(--accent-red);
+}
+
+.badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-size: 10px;
+  font-weight: 600;
+}
+
+.badge-green {
+  background: rgba(3, 201, 136, 0.15);
+  color: var(--accent-green);
+}
+
+.badge-red {
+  background: rgba(255, 77, 79, 0.15);
+  color: var(--accent-red);
+}
+
+.badge-yellow {
+  background: rgba(255, 195, 0, 0.15);
+  color: var(--accent-yellow);
+}
+
+.badge-gray {
+  background: rgba(120, 123, 145, 0.2);
+  color: var(--text-muted);
+}
+
+.right-column {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.wallet-body {
+  padding: 22px 18px;
+  text-align: center;
+}
+
+.wallet-label {
+  font-size: 12px;
+  color: var(--text-muted);
+  margin-bottom: 6px;
+}
+
+.wallet-balance {
+  font-size: 28px;
+  font-weight: 700;
+}
+
+.wallet-balance span {
+  font-size: 14px;
+  margin-left: 4px;
+  color: var(--accent-green);
+}
+
+.logs-body {
+  padding: 10px 12px;
+  max-height: 260px;
+  overflow: auto;
+  font-size: 11px;
+}
+
+.log-item {
+  padding: 4px 0;
+  border-bottom: 1px solid #181b28;
+}
+
+.log-time {
+  color: var(--text-muted);
+  margin-right: 4px;
+}
+
+.log-source {
+  color: #58a6ff;
+  margin-right: 4px;
+}
+
+.log-info {
+  color: var(--text-main);
+}
+
+.log-warn {
+  color: var(--accent-yellow);
+}
+
+.log-error {
+  color: var(--accent-red);
+}
+
+.loading {
+  padding: 16px;
+  text-align: center;
+  color: var(--text-muted);
+}
+
+@media (max-width: 960px) {
+  .app-main {
+    grid-template-columns: 1fr;
+  }
+}
