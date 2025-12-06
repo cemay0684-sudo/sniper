@@ -11,7 +11,9 @@ interface DashboardRow {
   symbol: string;
   price: number | null;
   cvd15m: number | null;
-  oiChangePct: number | null;
+  oiChangePct15m?: number | null;
+  oiChangePct1h?: number | null;
+  openInterest?: number | null;
   rvol15m: number | null;
   fundingRate: number | null;
   imbalanceScore: number | null;
@@ -40,7 +42,7 @@ interface SystemLog {
 }
 
 function formatNumber(value: number | null | undefined, decimals = 2): string {
-  if (value === null || value === undefined || isNaN(value)) return "-";
+  if (value === null || value === undefined || Number.isNaN(value)) return "-";
   return value.toFixed(decimals);
 }
 
@@ -62,11 +64,14 @@ function App() {
         fetchMarketFunding()
       ]);
 
-      setDashboard(d.data);
-      setLastUpdate(d.lastUpdate);
-      setWallet(w.availableUSDT);
-      setLogs(l.logs.slice().reverse());
-      setMarketFunding(mf.data);
+      // API contract:
+      // - d.data is an array of dashboard rows (may already include oiChangePct15m/1h)
+      // - mf.data is market funding rows (openInterest)
+      setDashboard(d.data || []);
+      setLastUpdate(d.lastUpdate || "");
+      setWallet(w.availableUSDT ?? null);
+      setLogs((l.logs || []).slice().reverse());
+      setMarketFunding(mf.data || []);
     } catch (err) {
       console.error("Load error:", err);
     } finally {
@@ -80,7 +85,7 @@ function App() {
     return () => clearInterval(id);
   }, []);
 
-  // Dashboard + Funding verisini birleştir
+  // Merge marketFunding into dashboard rows (openInterest & fundingRate fallback)
   const mergedDashboard: DashboardRow[] = dashboard.map((row) => {
     const mf = marketFunding.find((m) => m.symbol === row.symbol);
     return {
@@ -88,7 +93,14 @@ function App() {
       fundingRate:
         mf && mf.fundingRate !== null && mf.fundingRate !== undefined
           ? mf.fundingRate
-          : row.fundingRate
+          : row.fundingRate,
+      openInterest:
+        mf && mf.openInterest !== null && mf.openInterest !== undefined
+          ? mf.openInterest
+          : row.openInterest ?? null,
+      // Ensure oiChange fields exist (they usually come from server dashboard)
+      oiChangePct15m: (row as any).oiChangePct15m ?? null,
+      oiChangePct1h: (row as any).oiChangePct1h ?? null
     };
   });
 
@@ -119,6 +131,8 @@ function App() {
                     <th>FİYAT</th>
                     <th>CVD (15M)</th>
                     <th>OI</th>
+                    <th>OI Δ(15m)</th>
+                    <th>OI Δ(1h)</th>
                     <th>RVOL</th>
                     <th>FUNDING</th>
                     <th>IMB</th>
@@ -131,35 +145,66 @@ function App() {
                 </thead>
                 <tbody>
                   {mergedDashboard.map((row) => {
-                    const mf = marketFunding.find(
-                      (m) => m.symbol === row.symbol
-                    );
-                    const oiValue = mf?.openInterest ?? null;
-
+                    const oiValue = row.openInterest ?? null;
                     return (
                       <tr key={row.symbol}>
                         <td className="cell-symbol">{row.symbol}</td>
                         <td>{formatNumber(row.price, 6)}</td>
                         <td
                           className={
-                            row.cvd15m && row.cvd15m > 0 ? "pos" : "neg"
+                            (row.cvd15m ?? 0) > 0 ? "pos" : (row.cvd15m ?? 0) < 0 ? "neg" : ""
                           }
                         >
                           {formatNumber(row.cvd15m, 2)}
                         </td>
+
+                        {/* OI */}
                         <td className="oi-cell">
                           {oiValue !== null && oiValue !== undefined
-                            ? oiValue.toLocaleString("en-US", {
+                            ? Number(oiValue).toLocaleString("en-US", {
                                 maximumFractionDigits: 2
                               })
                             : "-"}
                         </td>
+
+                        {/* OI Delta 15m */}
+                        <td
+                          className={
+                            row.oiChangePct15m != null
+                              ? row.oiChangePct15m > 0
+                                ? "pos"
+                                : "neg"
+                              : ""
+                          }
+                        >
+                          {row.oiChangePct15m != null
+                            ? `${row.oiChangePct15m.toFixed(2)}%`
+                            : "-"}
+                        </td>
+
+                        {/* OI Delta 1h */}
+                        <td
+                          className={
+                            row.oiChangePct1h != null
+                              ? row.oiChangePct1h > 0
+                                ? "pos"
+                                : "neg"
+                              : ""
+                          }
+                        >
+                          {row.oiChangePct1h != null
+                            ? `${row.oiChangePct1h.toFixed(2)}%`
+                            : "-"}
+                        </td>
+
                         <td>{formatNumber(row.rvol15m, 2)}</td>
                         <td
                           className={
-                            row.fundingRate && row.fundingRate < 0
-                              ? "neg"
-                              : "pos"
+                            row.fundingRate != null
+                              ? row.fundingRate < 0
+                                ? "neg"
+                                : "pos"
+                              : ""
                           }
                         >
                           {row.fundingRate !== null &&
@@ -229,22 +274,21 @@ function App() {
                           )}
                         </td>
                         <td>{row.divergence ? "YES" : "-"}</td>
-<td>
-  <span
-    className={
-      row.status === "PUSU"
-        ? "badge badge-yellow"
-        : row.status === "TRIGGER"
-        ? "badge badge-orange"
-        : row.status === "IN_TRADE"
-        ? "badge badge-green"
-        : "badge badge-gray"
-    }
-  >
-    {row.status}
-  </span>
-</td>
-
+                        <td>
+                          <span
+                            className={
+                              row.status === "PUSU"
+                                ? "badge badge-yellow"
+                                : row.status === "TRIGGER"
+                                ? "badge badge-orange"
+                                : row.status === "IN_TRADE"
+                                ? "badge badge-green"
+                                : "badge badge-gray"
+                            }
+                          >
+                            {row.status}
+                          </span>
+                        </td>
                       </tr>
                     );
                   })}
@@ -261,8 +305,7 @@ function App() {
             <div className="wallet-body">
               <div className="wallet-label">TOPLAM BAKİYE</div>
               <div className="wallet-balance">
-                {wallet !== null ? wallet.toFixed(2) : "-"}{" "}
-                <span>USDT</span>
+                {wallet !== null ? wallet.toFixed(2) : "-"} <span>USDT</span>
               </div>
             </div>
           </div>

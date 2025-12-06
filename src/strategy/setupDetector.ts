@@ -2,6 +2,7 @@ import { CandleState, Candle, Interval } from "../state/candleState";
 import { OrderflowState, ImbalanceBucket } from "../state/orderflowState";
 import { FundingState } from "../state/fundingState";
 import { FuturesSymbol } from "../types";
+import { addSystemLog } from "../utils/systemLog"; // <-- ekledim
 
 /**
  * Setup tipi (LONG veya SHORT)
@@ -196,7 +197,8 @@ function checkOiDrop(
   _prev15m: Candle | null
 ): boolean {
   const oiInfo = fundingState.getOpenInterest(symbol);
-  if (oiInfo.openInterest === null) {
+  // safe erişim: farklı tipler olabilir
+  if (!oiInfo || (oiInfo as any).openInterest === null || (oiInfo as any).openInterest === undefined) {
     return false;
   }
   return false;
@@ -296,6 +298,55 @@ export function check15mSetup(
     hasBarDeltaSign &&
     // hasOiDrop (şimdilik zorunlu değil) &&
     rvolInfo.hasRvol;
+
+  // LOGGING: sweep veya passed durumlarında sistem logu at
+  try {
+    if (hasSweep) {
+      const msg = `SWEEP_DETECTED ${symbol} ${direction} price=${currentPrice} swingLow4h=${zone.swingLow4h} swingHigh4h=${zone.swingHigh4h}`;
+      console.log(msg);
+      addSystemLog({
+        time: new Date().toISOString(),
+        level: "INFO",
+        source: "STRATEGY",
+        message: msg,
+        context: {
+          symbol,
+          direction,
+          price: currentPrice,
+          swingLow4h: zone.swingLow4h,
+          swingHigh4h: zone.swingHigh4h,
+          current15m,
+        },
+      });
+    }
+
+    if (passed) {
+      const msg = `SETUP_PASSED ${symbol} ${direction} price=${currentPrice}`;
+      console.log(msg);
+      addSystemLog({
+        time: new Date().toISOString(),
+        level: "INFO",
+        source: "STRATEGY",
+        message: msg,
+        context: {
+          symbol,
+          direction,
+          price: currentPrice,
+          debug: {
+            swingLow4h: zone.swingLow4h,
+            swingHigh4h: zone.swingHigh4h,
+            rvol: rvolInfo.rvol,
+            hasImbalance,
+            hasCvdDivergence,
+            hasBarDeltaSign,
+          },
+        },
+      });
+    }
+  } catch (e) {
+    // logging should never break flow
+    console.error("setupDetector logging error", e);
+  }
 
   return {
     direction,

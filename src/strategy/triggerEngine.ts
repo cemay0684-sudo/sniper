@@ -1,5 +1,5 @@
 import { CandleState, Candle, Interval } from "../state/candleState";
-import { OrderflowState } from "../state/orderflowState";
+import { OrderflowState, ImbalanceBucket } from "../state/orderflowState";
 import { FundingState } from "../state/fundingState";
 import { FuturesSymbol } from "../types";
 import {
@@ -11,6 +11,7 @@ import {
   checkSessionFilter /*, checkFundingFilter, checkDominanceFilter */,
 } from "./globalFilters";
 import { ExecutionClient, Side } from "../execution/executionClient";
+import { addSystemLog } from "../utils/systemLog";
 
 export interface TriggerSignal {
   id: string;
@@ -38,6 +39,7 @@ export interface SymbolDashboardState {
   hasPendingSetup: boolean;
   lastSetupHasSweep: boolean | null;
   lastSetupHasDiv: boolean | null;
+  statusString?: string; // "PUSU" | "TRIGGER" | "IN_TRADE" | "IDLE"
 }
 
 /**
@@ -51,17 +53,6 @@ export interface SymbolDashboardState {
  *
  * NOT (V1 KARARI):
  *  - Funding ve BTC Dominance filtreleri, REST tarafı stabil hale gelene kadar TRIGGER seviyesinde devre dışıdır.
- *  - GlobalFilters içindeki fonksiyonlar duruyor; ileride tekrar açmak çok kolay olacak.
- *
- * SL / TP (V1 KURAL):
- *  - LONG:
- *      entry = 5m close
- *      SL = entry * (1 - 0.01)  -> %1 aşağı
- *      TP = entry * (1 + 0.02)  -> %2 yukarı
- *  - SHORT:
- *      entry = 5m close
- *      SL = entry * (1 + 0.01)
- *      TP = entry * (1 - 0.02)
  */
 export class TriggerEngine {
   private candleState: CandleState;
@@ -102,6 +93,7 @@ export class TriggerEngine {
         hasPendingSetup: false,
         lastSetupHasSweep: null,
         lastSetupHasDiv: null,
+        statusString: "IDLE",
       };
     }
     return this.dashboardState[symbol];
@@ -192,8 +184,43 @@ export class TriggerEngine {
             }
           );
 
-          // Emir motorunu çağır
-          await this.executeSignal(signal);
+          // dashboard: set TRIGGER immediately
+          const dashBefore = this.getDashboardStateFor(symbol);
+          dashBefore.statusString = "TRIGGER";
+          addSystemLog({
+            time: new Date().toISOString(),
+            level: "INFO",
+            source: "STRATEGY",
+            message: `TRIGGER ${signal.direction} ${signal.symbol} @ ${signal.entryCandle5m.close}`,
+            context: { symbol: signal.symbol, direction: signal.direction },
+          });
+
+          // Emir motorunu çağır ve sonucu al
+          const result = await this.executeSignal(signal);
+
+          // update dashboard based on execution result
+          const dashAfter = this.getDashboardStateFor(symbol);
+          if (result && result.success) {
+            dashAfter.statusString = "IN_TRADE";
+            dashAfter.hasPendingSetup = false;
+            addSystemLog({
+              time: new Date().toISOString(),
+              level: "INFO",
+              source: "STRATEGY",
+              message: `IN_TRADE ${signal.direction} ${signal.symbol}`,
+              context: { symbol: signal.symbol, details: result },
+            });
+          } else {
+            dashAfter.statusString = "IDLE";
+            dashAfter.hasPendingSetup = false;
+            addSystemLog({
+              time: new Date().toISOString(),
+              level: "WARN",
+              source: "STRATEGY",
+              message: `EXEC_FAIL ${signal.direction} ${signal.symbol}`,
+              context: { symbol: signal.symbol, details: result },
+            });
+          }
 
           this.onSignalHandlers.forEach((h) => h(signal));
           this.removePending(ps);
@@ -206,8 +233,9 @@ export class TriggerEngine {
 
   /**
    * V1 SL/TP (%1 / %2) hesaplama + ExecutionClient.openPosition çağrısı.
+   * Artık executeSignal sonucu döndürüyor (openPosition sonucunu) — handle5mClose bunu kullanır.
    */
-  private async executeSignal(signal: TriggerSignal) {
+  private async executeSignal(signal: TriggerSignal): Promise<any> {
     const { symbol, direction, entryCandle5m } = signal;
     const entry = entryCandle5m.close;
 
@@ -249,6 +277,8 @@ export class TriggerEngine {
     } else {
       console.log("[TriggerEngine] Order execution success:", result.details);
     }
+
+    return result;
   }
 
   private addPendingSetup(
@@ -282,6 +312,15 @@ export class TriggerEngine {
     dash.hasPendingSetup = true;
     dash.lastSetupHasSweep = setupInfo.hasSweep;
     dash.lastSetupHasDiv = setupInfo.hasCvdDivergence;
+    dash.statusString = "PUSU";
+
+    addSystemLog({
+      time: new Date().toISOString(),
+      level: "INFO",
+      source: "STRATEGY",
+      message: `SETUP_PASSED ${direction} ${symbol} (15m openTime=${setupCandle15mOpenTime})`,
+      context: { symbol, direction, setupInfo },
+    });
 
     console.log(
       `[SETUP] ${direction} setup detected on ${symbol} (15m openTime=${setupCandle15mOpenTime})`,
@@ -305,6 +344,7 @@ export class TriggerEngine {
       const dash = this.getDashboardStateFor(ps.symbol);
       dash.hasPendingSetup = false;
       // lastSetupHasSweep / lastSetupHasDiv son setup bilgisini taşımaya devam ediyor
+      // statusString korunur (veya gerekirse IDLE yapılabilir)
     }
   }
 

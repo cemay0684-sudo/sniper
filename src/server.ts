@@ -14,6 +14,7 @@ import { TriggerEngine, TriggerSignal } from "./strategy/triggerEngine";
 import { ExecutionClient } from "./execution/executionClient";
 
 import { addSystemLog, getSystemLogs } from "./utils/systemLog";
+import axios from "axios";
 
 dotenv.config();
 
@@ -46,6 +47,81 @@ const triggerEngine = new TriggerEngine(
 let restPingOk: boolean | null = null;
 const SYMBOLS = CONFIG.symbols as FuturesSymbol[];
 const lastMarkPrices: Record<string, number> = {};
+
+// --- Güvenli OI numeric dönüşümü helper'ı ---
+function toNumericOI(raw: any): number | null {
+  if (raw === null || raw === undefined) return null;
+  if (typeof raw === "number") {
+    return Number.isFinite(raw) ? (raw as number) : null;
+  }
+  if (typeof raw === "object") {
+    const oiField = (raw as any).openInterest;
+    if (oiField === null || oiField === undefined) return null;
+    const v = Number(oiField);
+    return Number.isFinite(v) ? v : null;
+  }
+  const v = Number(raw);
+  return Number.isFinite(v) ? v : null;
+}
+
+// ---- OI history cache (in-memory) ----
+type OIEntry = { t: number; oi: number };
+const oiHistory: Map<string, OIEntry[]> = new Map();
+
+// DÜZELTME BURADA: Hafıza süresini 1 saatten 4 saate çıkardık.
+// Böylece "1 saat öncesi"ni aradığımızda veri kesinlikle hafızada oluyor.
+const OI_POLL_INTERVAL_MS = 30 * 1000;
+const OI_HISTORY_KEEP_MS = 4 * 60 * 60 * 1000; // 4 hours (Eskiden 1 saatti)
+
+function ingestOI(symbol: string, oi: number, ts = Date.now()) {
+  const arr = oiHistory.get(symbol) ?? [];
+  
+  const exists = arr.find(e => e.t === ts);
+  if (!exists) {
+      arr.push({ t: ts, oi });
+      arr.sort((a, b) => a.t - b.t);
+  }
+
+  const now = Date.now();
+  const cutoff = now - OI_HISTORY_KEEP_MS;
+  const newArr = arr.filter(x => x.t >= cutoff);
+  oiHistory.set(symbol, newArr);
+}
+
+function getOIAt(symbol: string, targetTs: number): number | null {
+  const arr = oiHistory.get(symbol);
+  if (!arr || arr.length === 0) return null;
+  
+  // En yakın tarihi bulmak için sondan başa tarama
+  for (let i = arr.length - 1; i >= 0; i--) {
+    if (arr[i].t <= targetTs) return arr[i].oi;
+  }
+  return null;
+}
+
+// start background poller (best-effort)
+setTimeout(() => {
+  (async function startOiPoller() {
+    try {
+      // init
+    } catch (e) {}
+
+    setInterval(async () => {
+      const ts = Date.now();
+      for (const sym of SYMBOLS) {
+        try {
+          const oiRaw = fundingState.getOpenInterest(sym);
+          const oiNum = toNumericOI(oiRaw);
+          if (oiNum !== null) {
+            ingestOI(sym, oiNum, ts);
+          }
+        } catch (err) {
+          console.error("[OI POLLER] error for", sym, err);
+        }
+      }
+    }, OI_POLL_INTERVAL_MS);
+   })();
+}, 5000);
 
 // ---- Strategy signal -> logs ----
 triggerEngine.onSignal((signal: TriggerSignal) => {
@@ -91,8 +167,6 @@ wsClient.onKline((kline: KlineEvent) => {
   candleState.handleKline(kline);
 
   if (!kline.k.x) return;
-
-  const symbol = kline.s.toUpperCase() as FuturesSymbol;
   const interval = kline.k.i;
 
   console.log(
@@ -112,9 +186,6 @@ wsClient.onMarkPrice((mark: MarkPriceEvent) => {
   if (Number.isFinite(price)) {
     lastMarkPrices[symbol] = price;
   }
-  console.log(
-    `[markPrice] ${mark.s} mark=${mark.p} fundingRate=${mark.r} nextFundingTs=${mark.T}`
-  );
 });
 
 // ---- Zone hesaplama ----
@@ -149,12 +220,11 @@ function getZoneLabelFromSwingAndPrice(
 app.get("/health", (_req, res) => {
   const wsHealth = wsClient.getHealth();
   const exampleSymbol = SYMBOLS[0];
-
   const ofState = orderflowState.getSymbolState(exampleSymbol);
   const rvol15m = candleState.getRVOL15m(exampleSymbol);
   const swing = candleState.getSwingHighLow4h(exampleSymbol);
   const funding = fundingState.getFunding(exampleSymbol);
-  const oi = fundingState.getOpenInterest(exampleSymbol);
+  const oi = toNumericOI(fundingState.getOpenInterest(exampleSymbol));
   const btcDom = fundingState.getBtcDominance();
 
   res.json({
@@ -192,11 +262,7 @@ app.get("/debug/zone/:symbol", (req, res) => {
   const sym = (req.params.symbol || "").toUpperCase() as FuturesSymbol;
 
   if (!CONFIG.symbols.includes(sym)) {
-    return res.status(400).json({
-      error: `Symbol ${sym} CONFIG.symbols içinde yok. Mevcut: ${CONFIG.symbols.join(
-        ", "
-      )}`
-    });
+    return res.status(400).json({ error: "Symbol not found in config" });
   }
 
   const price = lastMarkPrices[sym] ?? null;
@@ -228,6 +294,56 @@ app.get("/debug/zone/:symbol", (req, res) => {
   });
 });
 
+// DEBUG: OI history + current funding state
+app.get("/debug/oi", (req, res) => {
+  try {
+    const data: any[] = [];
+    const now = Date.now();
+    for (const sym of SYMBOLS) {
+      const hist = oiHistory.get(sym) ?? [];
+      const first = hist.length > 0 ? hist[0] : null;
+      const last = hist.length > 0 ? hist[hist.length - 1] : null;
+      const oiRaw = (fundingState as any).getOpenInterest(sym);
+      const oiNow = toNumericOI(oiRaw);
+      data.push({
+        symbol: sym,
+        historyLength: hist.length,
+        earliest: first ? { t: first.t, oi: first.oi, agoMs: now - first.t } : null,
+        latest: last ? { t: last.t, oi: last.oi, agoMs: now - last.t } : null,
+        oiNowRaw: oiRaw,
+        oiNowNumeric: oiNow
+      });
+    }
+    return res.json({ ok: true, ts: new Date().toISOString(), data });
+  } catch (err: any) {
+    console.error("[DEBUG] /debug/oi error", err);
+    return res.status(500).json({ ok: false, error: String(err) });
+  }
+});
+
+// DEBUG: fundingState raw getter
+app.get("/debug/funding/:symbol", (req, res) => {
+  try {
+    const symRaw = ((req.params.symbol || "") as string).toUpperCase();
+    const sym = symRaw as any;
+    if (!CONFIG.symbols.includes(sym)) {
+      return res.status(400).json({ error: "Symbol not in config" });
+    }
+    const oiRaw = (fundingState as any).getOpenInterest(sym);
+    const funding = (fundingState as any).getFunding(sym);
+    return res.json({
+      ok: true,
+      symbol: sym,
+      oiRaw,
+      oiNumeric: toNumericOI(oiRaw),
+      funding
+    });
+  } catch (err: any) {
+    console.error("[DEBUG] /debug/funding error", err);
+    return res.status(500).json({ ok: false, error: String(err) });
+  }
+});
+
 // ---- DASHBOARD API ----
 app.get("/api/dashboard", (_req, res) => {
   const rows = SYMBOLS.map((sym) => {
@@ -236,6 +352,7 @@ app.get("/api/dashboard", (_req, res) => {
     const price = lastMarkPrices[sym] ?? null;
     const swing = candleState.getSwingHighLow4h(sym);
     const funding = fundingState.getFunding(sym);
+    const engineState = triggerEngine.getDashboardStateFor(sym);
 
     const imbalanceScore = orderflowState.getImbalanceScore(
       sym,
@@ -248,7 +365,6 @@ app.get("/api/dashboard", (_req, res) => {
       swing.swingLow4h
     );
 
-    // 4H bias: swing high/low ortalamasına göre
     let bias4h: "LONG" | "SHORT" | "FLAT" | null = null;
     if (
       swing.swingHigh4h !== null &&
@@ -261,7 +377,6 @@ app.get("/api/dashboard", (_req, res) => {
       else bias4h = "FLAT";
     }
 
-    // 15M bias: cvd15m işaretine göre (örnek mantık)
     let bias15m: "LONG" | "SHORT" | "FLAT" | null = null;
     if (of.cvd !== null && of.cvd !== undefined) {
       if (of.cvd > 0) bias15m = "LONG";
@@ -269,18 +384,44 @@ app.get("/api/dashboard", (_req, res) => {
       else bias15m = "FLAT";
     }
 
+    // --- OI HESAPLAMA (DÜZELTİLDİ) ---
+    const oiRawNow = fundingState.getOpenInterest(sym);
+    let oiNow = toNumericOI(oiRawNow); 
+    const tsNow = Date.now();
+    
+    // YENİ: Eğer canlı veri (oiNow) henüz gelmediyse (null ise), 
+    // preload ile yüklediğimiz geçmiş verinin EN SONUNCUSUNU kullan.
+    if (oiNow === null) {
+       const historyArr = oiHistory.get(sym);
+       if (historyArr && historyArr.length > 0) {
+           oiNow = historyArr[historyArr.length - 1].oi;
+       }
+    }
+
+    const oi15m = getOIAt(sym, tsNow - 15 * 60 * 1000);
+    const oi1h = getOIAt(sym, tsNow - 60 * 60 * 1000);
+
+    function computePct(now: number | null, prev: number | null): number | null {
+      if (now === null || prev === null || !Number.isFinite(now) || !Number.isFinite(prev) || prev === 0) return null;
+      return ((now - prev) / prev) * 100;
+    }
+
+    const oiChangePct15m = computePct(oiNow, oi15m);
+    const oiChangePct1h = computePct(oiNow, oi1h);
+
     return {
       symbol: sym,
       price,
       cvd15m: of.cvd,
-      oiChangePct: null,
+      oiChangePct15m,
+      oiChangePct1h,
       rvol15m,
       fundingRate: funding.fundingRate ?? null,
       imbalanceScore,
       zone,
-      sweep: null,
-      divergence: null,
-      status: "IDLE" as const,
+      sweep: engineState.lastSetupHasSweep ?? null,
+      divergence: engineState.lastSetupHasDiv ?? null,
+      status: (engineState.statusString as any) || "IDLE",
       bias4h,
       bias15m
     };
@@ -328,14 +469,11 @@ app.get("/api/funding", (req, res) => {
 });
 
 // --- API: Open Interest (instant from Binance REST) ---
-// Usage: GET /api/open-interest?symbol=ETHUSDT
 app.get("/api/open-interest", async (req, res) => {
   try {
     const symbol = (req.query.symbol as string) || "ETHUSDT";
     const url = `https://fapi.binance.com/fapi/v1/openInterest?symbol=${encodeURIComponent(symbol)}`;
-
-    const axios = await import("axios");
-    const response = await axios.default.get(url, { timeout: 5000 });
+    const response = await axios.get(url, { timeout: 5000 });
 
     const data = response.data;
     return res.json({
@@ -381,7 +519,6 @@ const PORT = CONFIG.server.port;
 // ---- Historical preload ----
 async function preloadHistoricalCandles() {
   console.log("[PRELOAD] Fetching historical klines for all symbols...");
-
   for (const sym of SYMBOLS) {
     try {
       console.log("[PRELOAD] 4h klines for", sym);
@@ -395,8 +532,34 @@ async function preloadHistoricalCandles() {
       console.error("[PRELOAD] error for symbol", sym, err);
     }
   }
+  console.log("[PRELOAD] Candles done.");
+}
 
-  console.log("[PRELOAD] Done.");
+// ---- NEW: OI Historical Preload (FIXED URL) ----
+async function preloadOIHistory() {
+  console.log("[PRELOAD] Fetching historical Open Interest (Last 1 Hour) for all symbols...");
+  
+  for (const sym of SYMBOLS) {
+    try {
+      const url = `https://fapi.binance.com/futures/data/openInterestHist?symbol=${sym}&period=5m&limit=30`;
+      const resp = await axios.get(url, { timeout: 5000 });
+      const data = resp.data;
+      
+      if (Array.isArray(data)) {
+        for (const item of data) {
+           const t = Number(item.timestamp);
+           const oi = Number(item.sumOpenInterest);
+           if (Number.isFinite(t) && Number.isFinite(oi)) {
+             ingestOI(sym, oi, t);
+           }
+        }
+      }
+      await new Promise(r => setTimeout(r, 200));
+    } catch (err) {
+      console.error(`[PRELOAD] OI history failed for ${sym}`, String(err));
+    }
+  }
+  console.log("[PRELOAD] OI History done. Dashboard should show OI change now.");
 }
 
 app.listen(PORT, async () => {
@@ -409,11 +572,11 @@ app.listen(PORT, async () => {
 
   if (restPingOk) {
     await preloadHistoricalCandles();
+    await preloadOIHistory();
   }
 });
 
-// --- API: Market Funding + OI (UI için, gerçek Binance REST) ---
-// GET /api/market-funding
+// --- API: Market Funding + OI (UI için) ---
 app.get("/api/market-funding", async (_req, res) => {
   try {
     const symbols = CONFIG.symbols as FuturesSymbol[];
@@ -433,7 +596,6 @@ app.get("/api/market-funding", async (_req, res) => {
       let openInterest: number | null = null;
       let oiTime: number | null = null;
 
-      // Funding rate: gerçek Binance USDT-M
       try {
         const frRes = await axios.get(
           "https://fapi.binance.com/fapi/v1/fundingRate",
@@ -453,7 +615,6 @@ app.get("/api/market-funding", async (_req, res) => {
         console.error("[API] /api/market-funding funding error", sym, e);
       }
 
-      // Open interest: gerçek Binance USDT-M
       try {
         const oiRes = await axios.get(
           "https://fapi.binance.com/fapi/v1/openInterest",
