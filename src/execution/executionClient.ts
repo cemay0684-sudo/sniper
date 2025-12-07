@@ -1,3 +1,4 @@
+import "dotenv/config";
 import crypto from "crypto";
 import axios from "axios";
 import { CONFIG } from "../config";
@@ -16,18 +17,20 @@ interface OpenPositionParams {
   isolated: boolean;
 }
 
-/**
- * Testnet USDT-M Futures üzerinde:
- * - Bakiyeyi okur
- * - Pozisyon açar
- * - Pozisyon kapatır
- *
- * Veri (fiyat vs.) hala mainnet'ten geliyor; trade tarafı testnet'te.
- */
+type SymbolFilters = {
+  tickSize: number;
+  stepSize: number;
+  minQty: number;
+  minNotional: number;
+};
+
 export class ExecutionClient {
   private readonly apiKey: string;
   private readonly apiSecret: string;
   private readonly baseUrl: string = "https://testnet.binancefuture.com";
+
+  private symbolFilters: Record<string, SymbolFilters> = {};
+  private exchangeInfoLoaded = false;
 
   constructor() {
     this.apiKey = CONFIG.binance.apiKey;
@@ -77,20 +80,57 @@ export class ExecutionClient {
     return res.data;
   }
 
-  public roundPrice(_symbol: FuturesSymbol, price: number): number {
-    if (!Number.isFinite(price)) return price;
-    return Number(price.toFixed(2));
+  /** exchangeInfo yükle ve tick/step/minNotional bilgilerini sakla */
+  private async ensureExchangeInfo() {
+    if (this.exchangeInfoLoaded) return;
+    const url = `${this.baseUrl}/fapi/v1/exchangeInfo`;
+    const res = await axios.get<any>(url, { timeout: 10000 });
+    if (!res.data?.symbols) return;
+
+    for (const s of res.data.symbols) {
+      const name = s.symbol as string;
+      const priceFilter = s.filters.find((f: any) => f.filterType === "PRICE_FILTER");
+      const lotFilter = s.filters.find((f: any) => f.filterType === "LOT_SIZE");
+      const notionalFilter = s.filters.find((f: any) => f.filterType === "MIN_NOTIONAL");
+
+      const tickSize = Number(priceFilter?.tickSize ?? 0.0001);
+      const stepSize = Number(lotFilter?.stepSize ?? 0.001);
+      const minQty = Number(lotFilter?.minQty ?? 0);
+      const minNotional = Number(notionalFilter?.notional ?? notionalFilter?.minNotional ?? 0);
+
+      this.symbolFilters[name] = { tickSize, stepSize, minQty, minNotional };
+    }
+    this.exchangeInfoLoaded = true;
   }
 
-  public roundQuantity(_symbol: FuturesSymbol, qty: number): number {
-    if (!Number.isFinite(qty) || qty <= 0) return 0;
-    return Number(qty.toFixed(3));
+  private quantize(value: number, step: number, mode: "floor" | "round" | "ceil" = "floor") {
+    if (!Number.isFinite(value) || !Number.isFinite(step) || step <= 0) return value;
+    const n = value / step;
+    let q: number;
+    if (mode === "round") q = Math.round(n);
+    else if (mode === "ceil") q = Math.ceil(n);
+    else q = Math.floor(n);
+    return Number((q * step).toFixed(12));
   }
 
-  /**
-   * TESTNET USDT-M Futures bakiyesini okur.
-   * Endpoint: GET /fapi/v2/balance
-   */
+  private roundPrice(symbol: FuturesSymbol, price: number): number {
+    const tick = this.symbolFilters[symbol]?.tickSize ?? 0.0001;
+    return this.quantize(price, tick, "round");
+  }
+
+  private roundQuantity(
+    symbol: FuturesSymbol,
+    qty: number,
+    mode: "floor" | "round" | "ceil" = "floor"
+  ): number {
+    const step = this.symbolFilters[symbol]?.stepSize ?? 0.001;
+    const minQty = this.symbolFilters[symbol]?.minQty ?? 0;
+    const q = this.quantize(qty, step, mode);
+    if (q < minQty) return minQty;
+    return q;
+  }
+
+  /** TESTNET USDT-M Futures bakiyesini okur. */
   public async getAvailableUSDT(): Promise<number> {
     try {
       if (!this.apiKey || !this.apiSecret) {
@@ -141,14 +181,7 @@ export class ExecutionClient {
     }
   }
 
-  /**
-   * Testnet USDT-M'de pozisyon aç.
-   * - Leverage ayarla
-   * - Margin type ayarla
-   * - MARKET entry
-   * - STOP_MARKET SL
-   * - TAKE_PROFIT_MARKET TP
-   */
+  /** Testnet USDT-M'de pozisyon aç. */
   public async openPosition(params: OpenPositionParams): Promise<{
     success: boolean;
     error?: string;
@@ -170,10 +203,46 @@ export class ExecutionClient {
     }
 
     try {
-      const qtyRounded = this.roundQuantity(symbol, quantity);
+      await this.ensureExchangeInfo();
+      const filters = this.symbolFilters[symbol] || {
+        tickSize: 0.0001,
+        stepSize: 0.001,
+        minQty: 0,
+        minNotional: 0
+      };
+
+      // fiyatlar
+      const entry = this.roundPrice(symbol, entryPrice);
+      const sl = this.roundPrice(symbol, stopLossPrice);
+      const tp = this.roundPrice(symbol, takeProfitPrice);
+
+      // miktar (girişte verilen quantity)
+      let qtyRounded = this.roundQuantity(symbol, quantity);
+
+      // min notional kontrolü: notional yetersizse yukarı yuvarla
+      if (filters.minNotional) {
+        const notional = entry * qtyRounded;
+        if (notional < filters.minNotional) {
+          const required = filters.minNotional / Math.max(entry, 1e-9);
+          qtyRounded = this.roundQuantity(symbol, required, "ceil");
+        }
+      }
+
       if (!Number.isFinite(qtyRounded) || qtyRounded <= 0) {
         return { success: false, error: "Invalid quantity after rounding" };
       }
+
+      const oppositeSide: Side = side === "BUY" ? "SELL" : "BUY";
+
+      console.log("[ExecutionClient] openPosition placing", {
+        symbol,
+        side,
+        qtyRounded,
+        entry,
+        sl,
+        tp,
+        filters
+      });
 
       // 1) Leverage
       try {
@@ -182,7 +251,10 @@ export class ExecutionClient {
           leverage
         });
       } catch (err: any) {
-        console.error("[ExecutionClient] leverage ayarlanamadı:", err.response?.data || err);
+        console.error(
+          "[ExecutionClient] leverage ayarlanamadı:",
+          err.response?.data || err
+        );
       }
 
       // 2) Margin type
@@ -192,9 +264,11 @@ export class ExecutionClient {
           marginType: isolated ? "ISOLATED" : "CROSSED"
         });
       } catch (err: any) {
-        // -4046 => Already isolated/crossed; önemli değil
         if (err.response?.data?.code !== -4046) {
-          console.error("[ExecutionClient] marginType ayarlanamadı:", err.response?.data || err);
+          console.error(
+            "[ExecutionClient] marginType ayarlanamadı:",
+            err.response?.data || err
+          );
         }
       }
 
@@ -205,11 +279,6 @@ export class ExecutionClient {
         type: "MARKET",
         quantity: qtyRounded
       });
-
-      const entry = this.roundPrice(symbol, entryPrice);
-      const sl = this.roundPrice(symbol, stopLossPrice);
-      const tp = this.roundPrice(symbol, takeProfitPrice);
-      const oppositeSide: Side = side === "BUY" ? "SELL" : "BUY";
 
       // 4) Stop Loss - STOP_MARKET closePosition=true
       const slOrder = await this.signedRequest<any>("POST", "/fapi/v1/order", {
@@ -246,20 +315,17 @@ export class ExecutionClient {
       };
     } catch (err: any) {
       console.error(
-        "[ExecutionClient] openPosition error:",
-        err.response?.data || err
+        "[ExecutionClient] openPosition error raw:",
+        JSON.stringify(err?.response?.data ?? err, null, 2)
       );
       return {
         success: false,
-        error: err.response?.data?.msg || String(err)
+        error: err?.response?.data?.msg || String(err)
       };
     }
   }
 
-  /**
-   * Testnet USDT-M'de pozisyon kapat.
-   * - Karşı taraf MARKET closePosition=true
-   */
+  /** Testnet USDT-M'de pozisyon kapat. */
   public async closePosition(
     symbol: FuturesSymbol,
     side: Side
@@ -269,6 +335,8 @@ export class ExecutionClient {
     }
 
     try {
+      await this.ensureExchangeInfo();
+
       const oppositeSide: Side = side === "BUY" ? "SELL" : "BUY";
 
       const res = await this.signedRequest<any>("POST", "/fapi/v1/order", {

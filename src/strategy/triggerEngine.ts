@@ -1,5 +1,5 @@
 import { CandleState, Candle, Interval } from "../state/candleState";
-import { OrderflowState, ImbalanceBucket } from "../state/orderflowState";
+import { OrderflowState } from "../state/orderflowState";
 import { FundingState } from "../state/fundingState";
 import { FuturesSymbol } from "../types";
 import {
@@ -7,9 +7,6 @@ import {
   SetupDirection,
   SetupCheckResult,
 } from "./setupDetector";
-import {
-  checkSessionFilter /*, checkFundingFilter, checkDominanceFilter */,
-} from "./globalFilters";
 import { ExecutionClient, Side } from "../execution/executionClient";
 import { addSystemLog } from "../utils/systemLog";
 
@@ -22,9 +19,6 @@ export interface TriggerSignal {
   createdAt: string;
 }
 
-/**
- * Setup bekleyen 15m mum bilgisi
- */
 interface PendingSetup {
   symbol: FuturesSymbol;
   direction: SetupDirection;
@@ -32,28 +26,13 @@ interface PendingSetup {
   setupInfo: SetupCheckResult;
 }
 
-/**
- * Dashboard için sembol bazlı özet durum
- */
 export interface SymbolDashboardState {
   hasPendingSetup: boolean;
   lastSetupHasSweep: boolean | null;
   lastSetupHasDiv: boolean | null;
-  statusString?: string; // "PUSU" | "TRIGGER" | "IN_TRADE" | "IDLE"
+  statusString?: string;
 }
 
-/**
- * TriggerEngine:
- *  - 15m mum kapanışlarında setup var mı diye bakar.
- *  - Varsa, o setup için bir "pending setup" kaydeder.
- *  - Sonraki 5m kapanışlarında:
- *      - LONG: yeşil mum (close > open) -> sinyal üret
- *      - SHORT: kırmızı mum (close < open) -> sinyal üret
- *  - Sinyali hem console.log ile gösterir hem de ExecutionClient'e emir atması için iletir.
- *
- * NOT (V1 KARARI):
- *  - Funding ve BTC Dominance filtreleri, REST tarafı stabil hale gelene kadar TRIGGER seviyesinde devre dışıdır.
- */
 export class TriggerEngine {
   private candleState: CandleState;
   private orderflowState: OrderflowState;
@@ -64,7 +43,6 @@ export class TriggerEngine {
 
   private onSignalHandlers: Array<(signal: TriggerSignal) => void> = [];
 
-  // Dashboard için sembol bazlı özet state
   private dashboardState: Record<FuturesSymbol, SymbolDashboardState> =
     {} as any;
 
@@ -84,9 +62,6 @@ export class TriggerEngine {
     this.onSignalHandlers.push(handler);
   }
 
-  /**
-   * Belirli bir sembol için dashboard özet state döner.
-   */
   public getDashboardStateFor(symbol: FuturesSymbol): SymbolDashboardState {
     if (!this.dashboardState[symbol]) {
       this.dashboardState[symbol] = {
@@ -100,12 +75,10 @@ export class TriggerEngine {
   }
 
   /**
-   * 15m mum kapanışında çağrılmalı.
-   * Tüm semboller için LONG ve SHORT setup'ları kontrol eder.
+   * 15m kapanışında: her sembol için LONG/SHORT setup'ı kontrol et, passed true ise pending'e ekle.
    */
   public handle15mClose(symbols: FuturesSymbol[]) {
     for (const symbol of symbols) {
-      // LONG setup
       const longSetup = check15mSetup(
         "LONG",
         symbol,
@@ -113,12 +86,10 @@ export class TriggerEngine {
         this.orderflowState,
         this.fundingState
       );
-
-      if (longSetup && longSetup.passed) {
+      if (longSetup?.passed) {
         this.addPendingSetup(symbol, "LONG", longSetup);
       }
 
-      // SHORT setup
       const shortSetup = check15mSetup(
         "SHORT",
         symbol,
@@ -126,24 +97,16 @@ export class TriggerEngine {
         this.orderflowState,
         this.fundingState
       );
-
-      if (shortSetup && shortSetup.passed) {
+      if (shortSetup?.passed) {
         this.addPendingSetup(symbol, "SHORT", shortSetup);
       }
     }
   }
 
   /**
-   * 5m mum kapanışında çağrılmalı.
-   * Pending setup'lar için tetik (trigger) şartını kontrol eder ve gerekirse emir atar.
+   * 5m kapanışında: pending varsa tetikle.
    */
   public async handle5mClose(symbols: FuturesSymbol[]) {
-    // Session filtresi (global)
-    const session = checkSessionFilter(new Date());
-    if (!session.allowed) {
-      return;
-    }
-
     for (const symbol of symbols) {
       const candles5m = this.candleState
         .getCandles(symbol, "5m" as Interval, 10)
@@ -157,15 +120,7 @@ export class TriggerEngine {
       if (relatedSetups.length === 0) continue;
 
       for (const ps of relatedSetups) {
-        const isGreen = last5m.close > last5m.open;
-        const isRed = last5m.close < last5m.open;
-
-        let triggered = false;
-        if (ps.direction === "LONG" && isGreen) {
-          triggered = true;
-        } else if (ps.direction === "SHORT" && isRed) {
-          triggered = true;
-        }
+        const triggered = true;
 
         if (triggered) {
           const signal: TriggerSignal = {
@@ -179,12 +134,9 @@ export class TriggerEngine {
 
           console.log(
             `[TRIGGER] ${signal.direction} signal on ${signal.symbol} at 5m close=${signal.entryCandle5m.close}`,
-            {
-              setup: signal.setupInfo,
-            }
+            { setup: signal.setupInfo }
           );
 
-          // dashboard: set TRIGGER immediately
           const dashBefore = this.getDashboardStateFor(symbol);
           dashBefore.statusString = "TRIGGER";
           addSystemLog({
@@ -195,10 +147,8 @@ export class TriggerEngine {
             context: { symbol: signal.symbol, direction: signal.direction },
           });
 
-          // Emir motorunu çağır ve sonucu al
           const result = await this.executeSignal(signal);
 
-          // update dashboard based on execution result
           const dashAfter = this.getDashboardStateFor(symbol);
           if (result && result.success) {
             dashAfter.statusString = "IN_TRADE";
@@ -224,8 +174,6 @@ export class TriggerEngine {
 
           this.onSignalHandlers.forEach((h) => h(signal));
           this.removePending(ps);
-        } else {
-          // İleride: belirli sayıda 5m mum geçerse pending setup'ı iptal edebiliriz.
         }
       }
     }
@@ -233,7 +181,6 @@ export class TriggerEngine {
 
   /**
    * V1 SL/TP (%1 / %2) hesaplama + ExecutionClient.openPosition çağrısı.
-   * Artık executeSignal sonucu döndürüyor (openPosition sonucunu) — handle5mClose bunu kullanır.
    */
   private async executeSignal(signal: TriggerSignal): Promise<any> {
     const { symbol, direction, entryCandle5m } = signal;
@@ -245,12 +192,12 @@ export class TriggerEngine {
 
     if (direction === "LONG") {
       side = "BUY";
-      sl = entry * (1 - 0.01); // -1%
-      tp = entry * (1 + 0.02); // +2%
+      sl = entry * (1 - 0.01);
+      tp = entry * (1 + 0.02);
     } else {
       side = "SELL";
-      sl = entry * (1 + 0.01); // +1%
-      tp = entry * (1 - 0.02); // -2%
+      sl = entry * (1 + 0.01);
+      tp = entry * (1 - 0.02);
     }
 
     console.log("[TriggerEngine] Executing signal with SL/TP:", {
@@ -264,7 +211,7 @@ export class TriggerEngine {
     const result = await this.executionClient.openPosition({
       symbol,
       side,
-      quantity: 0, // Gerçek qty ExecutionClient içinde available balance'a göre hesaplanıyor
+      quantity: 0, // qty sinyalden gelmiyor; minNotional/step’e göre ExecutionClient yukarı yuvarlar
       entryPrice: entry,
       stopLossPrice: sl,
       takeProfitPrice: tp,
@@ -295,9 +242,7 @@ export class TriggerEngine {
         ps.direction === direction &&
         ps.setupCandle15mOpenTime === setupCandle15mOpenTime
     );
-    if (existing) {
-      return;
-    }
+    if (existing) return;
 
     const ps: PendingSetup = {
       symbol,
@@ -307,7 +252,6 @@ export class TriggerEngine {
     };
     this.pendingSetups.push(ps);
 
-    // Dashboard state: bu sembolde artık pending setup var
     const dash = this.getDashboardStateFor(symbol);
     dash.hasPendingSetup = true;
     dash.lastSetupHasSweep = setupInfo.hasSweep;
@@ -338,13 +282,10 @@ export class TriggerEngine {
         )
     );
 
-    // Eğer bu sembol için hiç pending setup kalmadıysa dashboard state'i temizle
     const stillHas = this.pendingSetups.some((p) => p.symbol === ps.symbol);
     if (!stillHas) {
       const dash = this.getDashboardStateFor(ps.symbol);
       dash.hasPendingSetup = false;
-      // lastSetupHasSweep / lastSetupHasDiv son setup bilgisini taşımaya devam ediyor
-      // statusString korunur (veya gerekirse IDLE yapılabilir)
     }
   }
 

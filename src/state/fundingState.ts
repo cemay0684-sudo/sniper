@@ -1,6 +1,7 @@
 import { BinanceRestClient } from "../binanceRestClient";
 import { CONFIG } from "../config";
 import { FuturesSymbol } from "../types";
+import axios from "axios";
 
 export interface SymbolFundingState {
   symbol: FuturesSymbol;
@@ -62,23 +63,52 @@ export class FundingState {
 
   /**
    * Tüm semboller için funding ve OI güncelle.
+   * Funding için: önce restClient, null ise HTTP fallback (fapi/v1/fundingRate).
    */
   public async refreshAll(): Promise<void> {
     const symbols = CONFIG.symbols as FuturesSymbol[];
 
     for (const sym of symbols) {
       try {
-        const [funding, oi] = await Promise.all([
-          this.restClient.getFundingRate(sym),
-          this.restClient.getOpenInterest(sym)
-        ]);
+        // Funding: binance-api-node -> fallback HTTP
+        let fundingInfo: SymbolFundingState | null = null;
 
-        if (funding) {
-          this.funding.set(sym, {
+        const fr = await this.restClient.getFundingRate(sym);
+        if (fr) {
+          fundingInfo = {
             symbol: sym,
-            fundingRate: funding.fundingRate,
-            fundingTime: funding.fundingTime
-          });
+            fundingRate: fr.fundingRate,
+            fundingTime: fr.fundingTime
+          };
+        }
+
+        if (!fundingInfo) {
+          try {
+            const frRes = await axios.get(
+              "https://fapi.binance.com/fapi/v1/fundingRate",
+              { params: { symbol: sym, limit: 1 }, timeout: 5000 }
+            );
+            if (Array.isArray(frRes.data) && frRes.data.length > 0) {
+              const item = frRes.data[0] as any;
+              const frNum = Number(item.fundingRate);
+              const ftNum = Number(item.fundingTime);
+              if (Number.isFinite(frNum)) {
+                fundingInfo = {
+                  symbol: sym,
+                  fundingRate: frNum,
+                  fundingTime: Number.isFinite(ftNum) ? ftNum : null
+                };
+              }
+            }
+          } catch (e) {
+            console.error("FundingState: HTTP fallback funding error", sym, e);
+          }
+        }
+
+        const oi = await this.restClient.getOpenInterest(sym);
+
+        if (fundingInfo) {
+          this.funding.set(sym, fundingInfo);
         }
 
         if (oi) {

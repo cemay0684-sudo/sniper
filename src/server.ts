@@ -24,7 +24,7 @@ app.use(
   cors({
     origin: "http://52.69.165.88:5173",
     methods: ["GET", "POST", "OPTIONS"],
-    allowedHeaders: ["Content-Type"]
+    allowedHeaders: ["Content-Type"],
   })
 );
 
@@ -51,9 +51,7 @@ const lastMarkPrices: Record<string, number> = {};
 // --- Güvenli OI numeric dönüşümü helper'ı ---
 function toNumericOI(raw: any): number | null {
   if (raw === null || raw === undefined) return null;
-  if (typeof raw === "number") {
-    return Number.isFinite(raw) ? (raw as number) : null;
-  }
+  if (typeof raw === "number") return Number.isFinite(raw) ? raw : null;
   if (typeof raw === "object") {
     const oiField = (raw as any).openInterest;
     if (oiField === null || oiField === undefined) return null;
@@ -68,60 +66,76 @@ function toNumericOI(raw: any): number | null {
 type OIEntry = { t: number; oi: number };
 const oiHistory: Map<string, OIEntry[]> = new Map();
 
-// DÜZELTME BURADA: Hafıza süresini 1 saatten 4 saate çıkardık.
-// Böylece "1 saat öncesi"ni aradığımızda veri kesinlikle hafızada oluyor.
 const OI_POLL_INTERVAL_MS = 30 * 1000;
-const OI_HISTORY_KEEP_MS = 4 * 60 * 60 * 1000; // 4 hours (Eskiden 1 saatti)
+const OI_HISTORY_KEEP_MS = 4 * 60 * 60 * 1000; // 4 hours
+const FUNDING_REFRESH_MS = 30 * 1000;
 
 function ingestOI(symbol: string, oi: number, ts = Date.now()) {
   const arr = oiHistory.get(symbol) ?? [];
-  
-  const exists = arr.find(e => e.t === ts);
+  const exists = arr.find((e) => e.t === ts);
   if (!exists) {
-      arr.push({ t: ts, oi });
-      arr.sort((a, b) => a.t - b.t);
+    arr.push({ t: ts, oi });
+    arr.sort((a, b) => a.t - b.t);
   }
-
-  const now = Date.now();
-  const cutoff = now - OI_HISTORY_KEEP_MS;
-  const newArr = arr.filter(x => x.t >= cutoff);
-  oiHistory.set(symbol, newArr);
+  const cutoff = Date.now() - OI_HISTORY_KEEP_MS;
+  oiHistory.set(
+    symbol,
+    arr.filter((x) => x.t >= cutoff)
+  );
 }
 
-function getOIAt(symbol: string, targetTs: number): number | null {
+/**
+ * targetTs'ten daha eski/eşit en yakın OI değerini getirir.
+ * Eğer yoksa (ör. 15 dk öncesine ait sample yoksa) en yakın zamandaki değeri döner.
+ */
+function getOIAt(
+  symbol: string,
+  targetTs: number,
+  allowNearestIfNone = true
+): number | null {
   const arr = oiHistory.get(symbol);
   if (!arr || arr.length === 0) return null;
-  
-  // En yakın tarihi bulmak için sondan başa tarama
+
+  // Önce targetTs'den eski/eşit en yakınını bul
   for (let i = arr.length - 1; i >= 0; i--) {
     if (arr[i].t <= targetTs) return arr[i].oi;
   }
+
+  // Hiçbir kayıt targetTs'den eski/eşit değilse, en yakın kaydı döndür (isteğe bağlı)
+  if (allowNearestIfNone) {
+    let best = arr[0];
+    let bestDiff = Math.abs(arr[0].t - targetTs);
+    for (let i = 1; i < arr.length; i++) {
+      const d = Math.abs(arr[i].t - targetTs);
+      if (d < bestDiff) {
+        best = arr[i];
+        bestDiff = d;
+      }
+    }
+    return best?.oi ?? null;
+  }
+
   return null;
 }
 
-// start background poller (best-effort)
-setTimeout(() => {
-  (async function startOiPoller() {
-    try {
-      // init
-    } catch (e) {}
+async function refreshFundingAndOI() {
+  await fundingState.refreshAll();
+  const ts = Date.now();
+  for (const sym of SYMBOLS) {
+    const oiRaw = fundingState.getOpenInterest(sym);
+    const oiNum = toNumericOI(oiRaw);
+    if (oiNum !== null) ingestOI(sym, oiNum, ts);
+  }
+}
 
-    setInterval(async () => {
-      const ts = Date.now();
-      for (const sym of SYMBOLS) {
-        try {
-          const oiRaw = fundingState.getOpenInterest(sym);
-          const oiNum = toNumericOI(oiRaw);
-          if (oiNum !== null) {
-            ingestOI(sym, oiNum, ts);
-          }
-        } catch (err) {
-          console.error("[OI POLLER] error for", sym, err);
-        }
-      }
-    }, OI_POLL_INTERVAL_MS);
-   })();
-}, 5000);
+// Periodik refresh + ingest
+setInterval(async () => {
+  try {
+    await refreshFundingAndOI();
+  } catch (err) {
+    console.error("[FUNDING/OI REFRESH] error", err);
+  }
+}, FUNDING_REFRESH_MS);
 
 // ---- Strategy signal -> logs ----
 triggerEngine.onSignal((signal: TriggerSignal) => {
@@ -133,8 +147,8 @@ triggerEngine.onSignal((signal: TriggerSignal) => {
     context: {
       symbol: signal.symbol,
       direction: signal.direction,
-      entry: signal.entryCandle5m.close
-    }
+      entry: signal.entryCandle5m.close,
+    },
   });
 });
 
@@ -145,7 +159,7 @@ wsClient.onConnected(() => {
     time: new Date().toISOString(),
     level: "INFO",
     source: "WS",
-    message: "Connected to Binance WS"
+    message: "Connected to Binance WS",
   });
 });
 
@@ -155,7 +169,7 @@ wsClient.onDisconnected(() => {
     time: new Date().toISOString(),
     level: "WARN",
     source: "WS",
-    message: "Disconnected from Binance WS"
+    message: "Disconnected from Binance WS",
   });
 });
 
@@ -174,9 +188,9 @@ wsClient.onKline((kline: KlineEvent) => {
   );
 
   if (interval === "15m") {
-    triggerEngine.handle15mClose(SYMBOLS);
+    triggerEngine.handle15mClose([kline.s as FuturesSymbol]);
   } else if (interval === "5m") {
-    triggerEngine.handle5mClose(SYMBOLS);
+    triggerEngine.handle5mClose([kline.s as FuturesSymbol]);
   }
 });
 
@@ -194,9 +208,7 @@ function getZoneLabelFromSwingAndPrice(
   swingHigh4h: number | null,
   swingLow4h: number | null
 ): "DEMAND" | "SUPPLY" | "OUT" | null {
-  if (price === null || !Number.isFinite(price)) {
-    return "OUT";
-  }
+  if (price === null || !Number.isFinite(price)) return "OUT";
   if (
     swingHigh4h === null ||
     swingLow4h === null ||
@@ -206,11 +218,9 @@ function getZoneLabelFromSwingAndPrice(
   ) {
     return "OUT";
   }
-
   const range = swingHigh4h - swingLow4h;
   const lowerZoneEnd = swingLow4h + range * 0.25;
   const upperZoneStart = swingHigh4h - range * 0.25;
-
   if (price <= lowerZoneEnd) return "DEMAND";
   if (price >= upperZoneStart) return "SUPPLY";
   return "OUT";
@@ -237,34 +247,30 @@ app.get("/health", (_req, res) => {
       orderflow: {
         cvd: ofState.cvd,
         lastBucketsCount: ofState.buckets.length,
-        lastBuckets: ofState.buckets.slice(-5)
+        lastBuckets: ofState.buckets.slice(-5),
       },
       candles: {
         rvol15m,
         swingHigh4h: swing.swingHigh4h,
-        swingLow4h: swing.swingLow4h
+        swingLow4h: swing.swingLow4h,
       },
       funding,
       openInterest: oi,
-      btcDominance: btcDom
-    }
+      btcDominance: btcDom,
+    },
   });
 });
 
 app.get("/", (_req, res) => {
-  res.send(
-    "Smart Sniper Bot API is running. Strategy + Execution + Web API initialized."
-  );
+  res.send("Smart Sniper Bot API is running. Strategy + Execution + Web API initialized.");
 });
 
 // ---- DEBUG ZONE ----
 app.get("/debug/zone/:symbol", (req, res) => {
   const sym = (req.params.symbol || "").toUpperCase() as FuturesSymbol;
-
   if (!CONFIG.symbols.includes(sym)) {
     return res.status(400).json({ error: "Symbol not found in config" });
   }
-
   const price = lastMarkPrices[sym] ?? null;
   const swing = candleState.getSwingHighLow4h(sym);
   const zone = getZoneLabelFromSwingAndPrice(
@@ -289,13 +295,13 @@ app.get("/debug/zone/:symbol", (req, res) => {
       high: c.high,
       low: c.low,
       close: c.close,
-      volume: c.volume
-    }))
+      volume: c.volume,
+    })),
   });
 });
 
 // DEBUG: OI history + current funding state
-app.get("/debug/oi", (req, res) => {
+app.get("/debug/oi", (_req, res) => {
   try {
     const data: any[] = [];
     const now = Date.now();
@@ -311,7 +317,7 @@ app.get("/debug/oi", (req, res) => {
         earliest: first ? { t: first.t, oi: first.oi, agoMs: now - first.t } : null,
         latest: last ? { t: last.t, oi: last.oi, agoMs: now - last.t } : null,
         oiNowRaw: oiRaw,
-        oiNowNumeric: oiNow
+        oiNowNumeric: oiNow,
       });
     }
     return res.json({ ok: true, ts: new Date().toISOString(), data });
@@ -336,7 +342,7 @@ app.get("/debug/funding/:symbol", (req, res) => {
       symbol: sym,
       oiRaw,
       oiNumeric: toNumericOI(oiRaw),
-      funding
+      funding,
     });
   } catch (err: any) {
     console.error("[DEBUG] /debug/funding error", err);
@@ -384,25 +390,30 @@ app.get("/api/dashboard", (_req, res) => {
       else bias15m = "FLAT";
     }
 
-    // --- OI HESAPLAMA (DÜZELTİLDİ) ---
     const oiRawNow = fundingState.getOpenInterest(sym);
-    let oiNow = toNumericOI(oiRawNow); 
+    let oiNow = toNumericOI(oiRawNow);
     const tsNow = Date.now();
-    
-    // YENİ: Eğer canlı veri (oiNow) henüz gelmediyse (null ise), 
-    // preload ile yüklediğimiz geçmiş verinin EN SONUNCUSUNU kullan.
+
     if (oiNow === null) {
-       const historyArr = oiHistory.get(sym);
-       if (historyArr && historyArr.length > 0) {
-           oiNow = historyArr[historyArr.length - 1].oi;
-       }
+      const historyArr = oiHistory.get(sym);
+      if (historyArr && historyArr.length > 0) {
+        oiNow = historyArr[historyArr.length - 1].oi;
+      }
     }
 
-    const oi15m = getOIAt(sym, tsNow - 15 * 60 * 1000);
-    const oi1h = getOIAt(sym, tsNow - 60 * 60 * 1000);
+    // 15m ve 1h referansları; eğer tam 15m öncesi yoksa en yakınını al.
+    const oi15m = getOIAt(sym, tsNow - 15 * 60 * 1000, true);
+    const oi1h = getOIAt(sym, tsNow - 60 * 60 * 1000, true);
 
     function computePct(now: number | null, prev: number | null): number | null {
-      if (now === null || prev === null || !Number.isFinite(now) || !Number.isFinite(prev) || prev === 0) return null;
+      if (
+        now === null ||
+        prev === null ||
+        !Number.isFinite(now) ||
+        !Number.isFinite(prev) ||
+        prev === 0
+      )
+        return null;
       return ((now - prev) / prev) * 100;
     }
 
@@ -413,6 +424,7 @@ app.get("/api/dashboard", (_req, res) => {
       symbol: sym,
       price,
       cvd15m: of.cvd,
+      openInterest: oiNow ?? null,
       oiChangePct15m,
       oiChangePct1h,
       rvol15m,
@@ -423,13 +435,13 @@ app.get("/api/dashboard", (_req, res) => {
       divergence: engineState.lastSetupHasDiv ?? null,
       status: (engineState.statusString as any) || "IDLE",
       bias4h,
-      bias15m
+      bias15m,
     };
   });
 
   res.json({
     lastUpdate: new Date().toISOString(),
-    data: rows
+    data: rows,
   });
 });
 
@@ -437,7 +449,7 @@ app.get("/api/dashboard", (_req, res) => {
 app.get("/api/wallet", async (_req, res) => {
   const available = await executionClient.getAvailableUSDT();
   res.json({
-    availableUSDT: available
+    availableUSDT: available,
   });
 });
 
@@ -463,7 +475,7 @@ app.get("/api/funding", (req, res) => {
     return res.status(500).json({
       ok: false,
       error: "internal_error",
-      detail: String(err)
+      detail: String(err),
     });
   }
 });
@@ -481,15 +493,15 @@ app.get("/api/open-interest", async (req, res) => {
       data: {
         symbol: data.symbol,
         openInterest: Number(data.openInterest),
-        time: data.time
-      }
+        time: data.time,
+      },
     });
   } catch (err: any) {
     console.error("[API] /api/open-interest error", err?.response?.data || err);
     return res.status(500).json({
       ok: false,
       error: "internal_error",
-      detail: err?.response?.data || String(err)
+      detail: err?.response?.data || String(err),
     });
   }
 });
@@ -508,7 +520,7 @@ app.use(
       level: "ERROR",
       source: "SERVER",
       message: "Unhandled error",
-      context: String(err)
+      context: String(err),
     });
     res.status(500).json({ error: "Internal Server Error" });
   }
@@ -538,23 +550,23 @@ async function preloadHistoricalCandles() {
 // ---- NEW: OI Historical Preload (FIXED URL) ----
 async function preloadOIHistory() {
   console.log("[PRELOAD] Fetching historical Open Interest (Last 1 Hour) for all symbols...");
-  
+
   for (const sym of SYMBOLS) {
     try {
       const url = `https://fapi.binance.com/futures/data/openInterestHist?symbol=${sym}&period=5m&limit=30`;
       const resp = await axios.get(url, { timeout: 5000 });
       const data = resp.data;
-      
+
       if (Array.isArray(data)) {
         for (const item of data) {
-           const t = Number(item.timestamp);
-           const oi = Number(item.sumOpenInterest);
-           if (Number.isFinite(t) && Number.isFinite(oi)) {
-             ingestOI(sym, oi, t);
-           }
+          const t = Number(item.timestamp);
+          const oi = Number(item.sumOpenInterest);
+          if (Number.isFinite(t) && Number.isFinite(oi)) {
+            ingestOI(sym, oi, t);
+          }
         }
       }
-      await new Promise(r => setTimeout(r, 200));
+      await new Promise((r) => setTimeout(r, 200));
     } catch (err) {
       console.error(`[PRELOAD] OI history failed for ${sym}`, String(err));
     }
@@ -569,6 +581,13 @@ app.listen(PORT, async () => {
 
   restPingOk = await restClient.ping();
   console.log("Binance REST ping:", restPingOk ? "OK" : "FAILED");
+
+  // İlk funding/OI çekimi ve ingest
+  try {
+    await refreshFundingAndOI();
+  } catch (err) {
+    console.error("[INIT] funding/OI refresh failed", err);
+  }
 
   if (restPingOk) {
     await preloadHistoricalCandles();
@@ -601,7 +620,7 @@ app.get("/api/market-funding", async (_req, res) => {
           "https://fapi.binance.com/fapi/v1/fundingRate",
           {
             params: { symbol: sym, limit: 1 },
-            timeout: 5000
+            timeout: 5000,
           }
         );
         if (Array.isArray(frRes.data) && frRes.data.length > 0) {
@@ -620,7 +639,7 @@ app.get("/api/market-funding", async (_req, res) => {
           "https://fapi.binance.com/fapi/v1/openInterest",
           {
             params: { symbol: sym },
-            timeout: 5000
+            timeout: 5000,
           }
         );
         if (oiRes.data && typeof oiRes.data === "object") {
@@ -638,7 +657,7 @@ app.get("/api/market-funding", async (_req, res) => {
         fundingRate,
         fundingTime,
         openInterest,
-        oiTime
+        oiTime,
       });
     }
 
@@ -648,7 +667,7 @@ app.get("/api/market-funding", async (_req, res) => {
     return res.status(500).json({
       ok: false,
       error: "internal_error",
-      detail: String(err)
+      detail: String(err),
     });
   }
 });

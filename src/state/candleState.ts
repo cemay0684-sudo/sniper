@@ -19,10 +19,7 @@ function keyOf(symbol: FuturesSymbol, interval: Interval): string {
 }
 
 export class CandleState {
-  // key: "ETHUSDT_15m" gibi, value: Candle[]
   private candles: Map<string, Candle[]> = new Map();
-
-  // Hafızada tutacağımız maksimum mum sayısı (ör: 2000)
   private readonly maxCandlesPerSeries: number;
 
   constructor(maxCandlesPerSeries = 2000) {
@@ -39,15 +36,10 @@ export class CandleState {
     return list;
   }
 
-  /**
-   * Binance WS kline event'lerini işler.
-   */
   public handleKline(event: KlineEvent) {
     const symbol = event.s.toUpperCase() as FuturesSymbol;
     const interval = event.k.i as Interval;
-    if (interval !== "5m" && interval !== "15m" && interval !== "4h") {
-      return;
-    }
+    if (interval !== "5m" && interval !== "15m" && interval !== "4h") return;
 
     const list = this.ensureSeries(symbol, interval);
 
@@ -81,18 +73,12 @@ export class CandleState {
         closed
       };
       list.push(candle);
-
       if (list.length > this.maxCandlesPerSeries) {
         list.splice(0, list.length - this.maxCandlesPerSeries);
       }
     }
   }
 
-  /**
-   * REST'ten alınmış historical klines'i state'e yükler.
-   *  - klines: { openTime, closeTime, open, high, low, close, volume }
-   *  - Tümü closed kabul edilir.
-   */
   public ingestHistoricalCandles(
     symbol: FuturesSymbol,
     interval: Interval,
@@ -109,7 +95,6 @@ export class CandleState {
     const list = this.ensureSeries(symbol, interval);
 
     for (const k of klines) {
-      // Aynı openTime varsa overwrite et
       const existingIndex = list.findIndex((c) => c.openTime === k.openTime);
       const candle: Candle = {
         openTime: k.openTime,
@@ -129,7 +114,6 @@ export class CandleState {
       }
     }
 
-    // Zaman sırasına göre sırala ve trim et
     list.sort((a, b) => a.openTime - b.openTime);
     if (list.length > this.maxCandlesPerSeries) {
       list.splice(0, list.length - this.maxCandlesPerSeries);
@@ -148,57 +132,33 @@ export class CandleState {
 
   /**
    * RVOL:
-   * (Son 15m mumun hacmi) / (Son 96 adet 15m mumun hacim ortalaması)
+   * Son kapalı 15m mum hacmi / son 96 kapalı 15m mumun hacim ortalaması.
+   * Yeterli kapalı mum (<97) yoksa null döner.
    */
   public getRVOL15m(symbol: FuturesSymbol): number | null {
-    const list = this.ensureSeries(symbol, "15m");
-    if (list.length < 96 + 1) {
-      return null; // Yeterli veri yok
-    }
-
-    const last = list[list.length - 1];
-    if (!last.closed) {
-      const closedCandles = list.filter((c) => c.closed);
-      if (closedCandles.length < 96 + 1) return null;
-      const lastClosed = closedCandles[closedCandles.length - 1];
-      const prevForAvg = closedCandles.slice(
-        closedCandles.length - 1 - 96,
-        closedCandles.length - 1
-      );
-      const avgVol =
-        prevForAvg.reduce((sum, c) => sum + c.volume, 0) / prevForAvg.length;
-      if (avgVol === 0) return null;
-      return lastClosed.volume / avgVol;
-    } else {
-      const prev = list.slice(list.length - 1 - 96, list.length - 1);
-      const avgVol = prev.reduce((sum, c) => sum + c.volume, 0) / prev.length;
-      if (avgVol === 0) return null;
-      return last.volume / avgVol;
-    }
+    const closed = this.ensureSeries(symbol, "15m").filter((c) => c.closed);
+    if (closed.length < 97) return null; // 1 hedef + 96 geçmiş
+    const lastClosed = closed[closed.length - 1];
+    const prev = closed.slice(closed.length - 1 - 96, closed.length - 1);
+    const avgVol = prev.reduce((sum, c) => sum + c.volume, 0) / prev.length;
+    if (avgVol === 0) return null;
+    return lastClosed.volume / avgVol;
   }
 
-  /**
-   * 4h SwingHigh_4h ve SwingLow_4h:
-   * Son 20 adet 4h kapalı mumun en yüksek high / en düşük low
-   */
   public getSwingHighLow4h(symbol: FuturesSymbol): {
     swingHigh4h: number | null;
     swingLow4h: number | null;
   } {
     const list = this.ensureSeries(symbol, "4h").filter((c) => c.closed);
-    if (list.length < 20) {
-      return { swingHigh4h: null, swingLow4h: null };
-    }
+    if (list.length < 20) return { swingHigh4h: null, swingLow4h: null };
 
     const last20 = list.slice(list.length - 20);
     let maxHigh = -Infinity;
     let minLow = Infinity;
-
     for (const c of last20) {
       if (c.high > maxHigh) maxHigh = c.high;
       if (c.low < minLow) minLow = c.low;
     }
-
     return {
       swingHigh4h: isFinite(maxHigh) ? maxHigh : null,
       swingLow4h: isFinite(minLow) ? minLow : null
